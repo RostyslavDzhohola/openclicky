@@ -59,7 +59,8 @@ Prerequisites:
 Then:
 
 ```bash
-git clone <this repo>
+git clone https://github.com/RostyslavDzhohola/openclicky.git
+cd openclicky
 open leanring-buddy.xcodeproj
 ```
 
@@ -132,6 +133,9 @@ AGENTS.md                     # Full architecture doc (agents read this)
 Clicky is [Farza's](https://x.com/farzatv) creation, MIT licensed — his
 original README intro said "go crazy with this repo," so this fork did. The
 teach skill is [Matt Pocock's](https://www.aihero.dev/learn-anything-with-my-teach-skill).
-The subscription-brain + stateful-learning fork is an experiment in what Clicky
-becomes when the harness is Claude Code / Codex itself: a better UI on the
-agents you already have, free to run, with lessons you keep.
+
+OpenClicky — the subscription-brain + stateful-learning spin-off — is built and
+maintained by [Rostyslav Dzhohola](https://github.com/RostyslavDzhohola). It's an
+experiment in what Clicky becomes when the harness is Claude Code / Codex itself:
+a better UI on the agents you already have, free to run, with lessons you keep.
+Bugs, ideas, PRs welcome.
