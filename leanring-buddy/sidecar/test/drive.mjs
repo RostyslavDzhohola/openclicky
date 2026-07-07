@@ -1,0 +1,344 @@
+#!/usr/bin/env node
+// Terminal test harness for the sidecar. Spawns `node index.mjs` and speaks
+// the exact NDJSON protocol the macOS app uses, so every backend feature can
+// be verified without building the app (Xcode builds must not run from the
+// terminal — they invalidate TCC permissions).
+//
+// Usage:
+//   node test/drive.mjs chat   [--backend claude|codex] [--text "..."] [--image path] [--workspace id] [--real]
+//   node test/drive.mjs oneshot [--backend ...] [--image path]
+//   node test/drive.mjs teach  [--backend ...] [--topic "css flexbox basics"] [--real]
+//   node test/drive.mjs auth
+//   node test/drive.mjs workspaces
+//   node test/drive.mjs resume [--backend ...]   (two sidecar processes, proves continuity)
+//
+// By default all state goes to throwaway dirs under $TMPDIR (clicky-drive-*).
+// Pass --real to use the real ~/Documents/Clicky Lessons + Application Support.
+
+import { spawn } from "node:child_process";
+import { mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createInterface } from "node:readline";
+
+const sidecarDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+const commandLineArguments = process.argv.slice(2);
+const subcommand = commandLineArguments[0] ?? "chat";
+
+function flagValue(flagName, defaultValue) {
+  const flagIndex = commandLineArguments.indexOf(flagName);
+  if (flagIndex === -1 || flagIndex + 1 >= commandLineArguments.length) {
+    return defaultValue;
+  }
+  return commandLineArguments[flagIndex + 1];
+}
+
+const useRealDirectories = commandLineArguments.includes("--real");
+const backend = flagValue("--backend", "claude");
+const workspaceId = flagValue("--workspace", "general");
+
+const driveEnvironment = { ...process.env };
+if (!useRealDirectories) {
+  const lessonsRoot = join(tmpdir(), "clicky-drive-lessons");
+  const appSupport = join(tmpdir(), "clicky-drive-support");
+  mkdirSync(lessonsRoot, { recursive: true });
+  mkdirSync(appSupport, { recursive: true });
+  driveEnvironment.CLICKY_LESSONS_ROOT = lessonsRoot;
+  driveEnvironment.CLICKY_APP_SUPPORT = appSupport;
+  console.log(`[drive] lessons root: ${lessonsRoot}`);
+}
+
+class SidecarProcess {
+  constructor() {
+    this.child = spawn("node", ["index.mjs"], {
+      cwd: sidecarDirectory,
+      env: driveEnvironment,
+      stdio: ["pipe", "pipe", "inherit"],
+    });
+    this.eventWaiters = [];
+    this.intentionallyStopped = false;
+    this.exited = new Promise((resolveExit) => {
+      this.child.once("exit", resolveExit);
+    });
+    this.child.on("error", (error) => {
+      console.error(`[drive] failed to spawn sidecar: ${error.message}`);
+      process.exit(1);
+    });
+    this.child.on("exit", () => {
+      // Any exit we didn't ask for is a failure, even while idle — a crash
+      // between commands would otherwise surface only as a later timeout.
+      if (!this.intentionallyStopped) {
+        console.error("[drive] sidecar exited unexpectedly");
+        process.exit(1);
+      }
+    });
+    this.reader = createInterface({ input: this.child.stdout });
+    this.reader.on("line", (line) => {
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        console.log(`[drive] unparseable stdout line: ${line}`);
+        return;
+      }
+      console.log(`[event] ${JSON.stringify(event)}`);
+      for (const waiter of [...this.eventWaiters]) {
+        if (waiter.predicate(event)) {
+          this.eventWaiters.splice(this.eventWaiters.indexOf(waiter), 1);
+          waiter.resolve(event);
+        }
+      }
+    });
+  }
+
+  send(request) {
+    console.log(`[send]  ${JSON.stringify(request)}`);
+    this.child.stdin.write(JSON.stringify(request) + "\n");
+  }
+
+  waitFor(predicate, timeoutMs) {
+    return new Promise((resolvePromise, rejectPromise) => {
+      const timeoutHandle = setTimeout(
+        () => rejectPromise(new Error(`timed out after ${timeoutMs}ms`)),
+        timeoutMs
+      );
+      this.eventWaiters.push({
+        predicate,
+        resolve: (event) => {
+          clearTimeout(timeoutHandle);
+          resolvePromise(event);
+        },
+      });
+    });
+  }
+
+  /** Resolves with the result/error event matching the request id. */
+  waitForCompletion(requestId, timeoutMs) {
+    return this.waitFor(
+      (event) => event.id === requestId && (event.type === "result" || event.type === "error"),
+      timeoutMs
+    );
+  }
+
+  async stop() {
+    this.intentionallyStopped = true;
+    this.child.stdin.end();
+    // Bounded shutdown: a sidecar that ignores stdin EOF must not hang the
+    // whole drive — kill it and still wait for the exit event.
+    const shutdownTimeoutMs = 10_000;
+    await Promise.race([
+      this.exited,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`sidecar did not exit within ${shutdownTimeoutMs}ms`)), shutdownTimeoutMs)
+      ),
+    ]).catch((timeoutError) => {
+      console.error(`[drive] ${timeoutError.message}; killing sidecar`);
+      this.child.kill("SIGKILL");
+      return this.exited;
+    });
+  }
+}
+
+function assertCondition(condition, failureMessage) {
+  if (!condition) {
+    console.error(`\n[FAIL] ${failureMessage}`);
+    process.exit(1);
+  }
+}
+
+async function startSidecar() {
+  const sidecar = new SidecarProcess();
+  await sidecar.waitFor((event) => event.type === "ready", 15_000);
+  return sidecar;
+}
+
+let nextRequestNumber = 1;
+function newRequestId() {
+  return `drive-${nextRequestNumber++}`;
+}
+
+function buildImages() {
+  const imagePath = flagValue("--image", null);
+  if (!imagePath) return [];
+  return [
+    {
+      path: resolve(imagePath),
+      label: "Screen 1 (primary focus, cursor screen) (image dimensions: 1280x800 pixels)",
+    },
+  ];
+}
+
+async function runChatDrive() {
+  const sidecar = await startSidecar();
+  const requestId = newRequestId();
+  sidecar.send({
+    id: requestId,
+    type: "chat",
+    backend,
+    workspaceId,
+    model: "claude-sonnet-4-6",
+    text: flagValue("--text", "in one short sentence, what do you see on my screen?"),
+    images: buildImages(),
+    teachIntent: false,
+  });
+  const completion = await sidecar.waitForCompletion(requestId, 300_000);
+  assertCondition(completion.type === "result", `chat failed: ${completion.message}`);
+  assertCondition(
+    typeof completion.text === "string" && completion.text.trim().length > 0,
+    "chat returned empty text"
+  );
+  console.log(`\n[PASS] ${backend} chat responded (${completion.durationMs}ms):\n${completion.text}`);
+  await sidecar.stop();
+}
+
+async function runOneShotDrive() {
+  const sidecar = await startSidecar();
+  const requestId = newRequestId();
+  sidecar.send({
+    id: requestId,
+    type: "oneShot",
+    backend,
+    text: "look at this screen and make one short quirky comment about something you can see.",
+    images: buildImages(),
+    systemPrompt:
+      "you are a playful screen commentator. reply with one lowercase sentence only.",
+  });
+  const completion = await sidecar.waitForCompletion(requestId, 180_000);
+  assertCondition(completion.type === "result", `oneShot failed: ${completion.message}`);
+  assertCondition(completion.text.trim().length > 0, "oneShot returned empty text");
+  console.log(`\n[PASS] ${backend} oneShot responded:\n${completion.text}`);
+  await sidecar.stop();
+}
+
+async function runAuthDrive() {
+  const sidecar = await startSidecar();
+  const requestId = newRequestId();
+  sidecar.send({ id: requestId, type: "authStatus" });
+  const completion = await sidecar.waitForCompletion(requestId, 30_000);
+  assertCondition(completion.type === "result", "authStatus failed");
+  console.log(
+    `\n[PASS] auth — claude: ${completion.claude.loggedIn} (${completion.claude.method}), codex: ${completion.codex.loggedIn}, teach skill: ${JSON.stringify(completion.teachSkill)}`
+  );
+  await sidecar.stop();
+}
+
+async function runWorkspacesDrive() {
+  const sidecar = await startSidecar();
+  const createId = newRequestId();
+  sidecar.send({ id: createId, type: "createWorkspace", name: "Drive Test Topic" });
+  const createCompletion = await sidecar.waitForCompletion(createId, 240_000);
+  assertCondition(
+    createCompletion.type === "result",
+    `createWorkspace failed: ${createCompletion.message}`
+  );
+  console.log(`[drive] created: ${JSON.stringify(createCompletion.workspace)}`);
+
+  const listId = newRequestId();
+  sidecar.send({ id: listId, type: "listWorkspaces" });
+  const listCompletion = await sidecar.waitForCompletion(listId, 30_000);
+  assertCondition(
+    listCompletion.workspaces.some((workspace) => workspace.id === "drive-test-topic"),
+    "created workspace missing from list"
+  );
+  console.log(`\n[PASS] workspaces: ${listCompletion.workspaces.map((w) => w.id).join(", ")}`);
+  await sidecar.stop();
+}
+
+async function runTeachDrive() {
+  const sidecar = await startSidecar();
+  const topicName = flagValue("--topic", "css flexbox basics");
+
+  const createId = newRequestId();
+  sidecar.send({ id: createId, type: "createWorkspace", name: topicName });
+  const createCompletion = await sidecar.waitForCompletion(createId, 240_000);
+  assertCondition(
+    createCompletion.type === "result",
+    `createWorkspace failed: ${createCompletion.message}`
+  );
+  const workspace = createCompletion.workspace;
+  console.log(`[drive] workspace ready: ${workspace.path}`);
+
+  const lessonCreatedPromise = sidecar.waitFor(
+    (event) => event.type === "lessonCreated" && event.workspaceId === workspace.id,
+    600_000
+  );
+
+  const chatId = newRequestId();
+  sidecar.send({
+    id: chatId,
+    type: "chat",
+    backend,
+    workspaceId: workspace.id,
+    text: `${topicName}. my mission: i want a quick practical introduction. i am a complete beginner. success is understanding the core concepts. teach me the first lesson now — do not ask me clarifying questions, make reasonable assumptions and create the first lesson.`,
+    images: [],
+    teachIntent: true,
+  });
+
+  const chatCompletion = await sidecar.waitForCompletion(chatId, 600_000);
+  assertCondition(chatCompletion.type === "result", `teach chat failed: ${chatCompletion.message}`);
+  console.log(`\n[drive] teach turn finished:\n${chatCompletion.text}\n`);
+
+  const lessonEvent = await lessonCreatedPromise;
+  console.log(
+    `\n[PASS] lesson created at ${lessonEvent.path} (openedByAgent: ${lessonEvent.openedByAgent})`
+  );
+  await sidecar.stop();
+}
+
+async function runResumeDrive() {
+  const firstSidecar = await startSidecar();
+  const firstId = newRequestId();
+  const memorablePhrase = `banana-${Date.now()}`;
+  firstSidecar.send({
+    id: firstId,
+    type: "chat",
+    backend,
+    workspaceId: "general",
+    text: `remember this codeword for later: ${memorablePhrase}. reply with one word: ok.`,
+    images: [],
+  });
+  const firstCompletion = await firstSidecar.waitForCompletion(firstId, 300_000);
+  assertCondition(firstCompletion.type === "result", `first turn failed: ${firstCompletion.message}`);
+  await firstSidecar.stop();
+
+  const secondSidecar = await startSidecar();
+  const secondId = newRequestId();
+  secondSidecar.send({
+    id: secondId,
+    type: "chat",
+    backend,
+    workspaceId: "general",
+    text: "what was the codeword i asked you to remember? reply with the codeword only.",
+    images: [],
+  });
+  const secondCompletion = await secondSidecar.waitForCompletion(secondId, 300_000);
+  assertCondition(secondCompletion.type === "result", `second turn failed: ${secondCompletion.message}`);
+  assertCondition(
+    secondCompletion.text.includes(memorablePhrase.split("-")[0]),
+    `resume failed — codeword missing from: ${secondCompletion.text}`
+  );
+  console.log(`\n[PASS] ${backend} session resumed across sidecar restart:\n${secondCompletion.text}`);
+  await secondSidecar.stop();
+}
+
+const driveSubcommands = {
+  chat: runChatDrive,
+  oneshot: runOneShotDrive,
+  auth: runAuthDrive,
+  workspaces: runWorkspacesDrive,
+  teach: runTeachDrive,
+  resume: runResumeDrive,
+};
+
+const selectedDrive = driveSubcommands[subcommand];
+if (!selectedDrive) {
+  console.error(`unknown subcommand "${subcommand}" — one of: ${Object.keys(driveSubcommands).join(", ")}`);
+  process.exit(1);
+}
+
+selectedDrive().catch((driveError) => {
+  console.error(`\n[FAIL] ${driveError?.message ?? driveError}`);
+  process.exit(1);
+});

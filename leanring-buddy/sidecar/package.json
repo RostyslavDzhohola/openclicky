@@ -1,0 +1,27 @@
+{
+  "name": "clicky-sidecar",
+  "version": "1.0.0",
+  "description": "Clicky brain sidecar: hosts the Claude Agent SDK and OpenAI Codex SDK behind an NDJSON stdin/stdout protocol so the app can use existing Claude Pro/Max and ChatGPT-plan subscriptions.",
+  "type": "module",
+  "private": true,
+  "main": "index.mjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.mjs",
+    "drive": "node test/drive.mjs chat",
+    "drive:oneshot": "node test/drive.mjs oneshot",
+    "drive:teach": "node test/drive.mjs teach",
+    "drive:compare": "node test/compare.mjs",
+    "drive:auth": "node test/drive.mjs auth",
+    "drive:resume": "node test/drive.mjs resume",
+    "drive:workspaces": "node test/drive.mjs workspaces",
+    "clean": "rm -rf node_modules"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.202",
+    "@openai/codex-sdk": "^0.142.5",
+    "chokidar": "^4.0.0"
+  }
+}
