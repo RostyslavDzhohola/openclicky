@@ -39,6 +39,10 @@ const useRealDirectories = commandLineArguments.includes("--real");
 const backend = flagValue("--backend", "claude");
 const workspaceId = flagValue("--workspace", "general");
 
+function chatModelForBackend(selectedBackend) {
+  return selectedBackend === "claude" ? "claude-sonnet-4-6" : "default";
+}
+
 const driveEnvironment = { ...process.env };
 if (!useRealDirectories) {
   const lessonsRoot = join(tmpdir(), "clicky-drive-lessons");
@@ -178,7 +182,7 @@ async function runChatDrive() {
     type: "chat",
     backend,
     workspaceId,
-    model: "claude-sonnet-4-6",
+    model: chatModelForBackend(backend),
     text: flagValue("--text", "in one short sentence, what do you see on my screen?"),
     images: buildImages(),
     teachIntent: false,

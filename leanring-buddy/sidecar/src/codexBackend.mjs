@@ -24,6 +24,10 @@ function resolveCodexModel(requestedModel) {
   if (model === "" || model === "default") {
     return null;
   }
+  if (/^claude/i.test(model)) {
+    emitLog("warn", `ignoring non-codex model override ${model}`);
+    return null;
+  }
   return model;
 }
 
@@ -203,6 +207,9 @@ function makeBackendError(code, message) {
 
 function toBackendError(originalError) {
   const message = String(originalError?.message ?? originalError);
+  if (message.includes("not supported when using Codex") || message.includes('"type":"invalid_request_error"')) {
+    return makeBackendError("internal", message);
+  }
   const isAuthProblem = /401|unauthorized|not logged in|login|authent/i.test(message);
   return makeBackendError(
     isAuthProblem ? "auth_required" : "internal",

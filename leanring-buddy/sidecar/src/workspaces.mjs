@@ -23,7 +23,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { COMPANION_RULES } from "./companionRules.mjs";
+import { COMPANION_WORKSPACE_NOTES } from "./companionRules.mjs";
 import { emitLog } from "./protocol.mjs";
 
 export const GENERAL_WORKSPACE_ID = "general";
@@ -86,8 +86,8 @@ export function slugifyTopicName(topicName) {
 
 /**
  * Creates (or returns, if it already exists) a workspace folder for a topic.
- * Writes AGENTS.md so the Codex CLI natively picks up the companion voice
- * rules (Claude gets the same rules via the system-prompt append instead).
+ * Writes AGENTS.md so the Codex CLI natively picks up slim companion voice
+ * notes (Claude gets the full rules via the system-prompt append instead).
  * The teach skill itself is installed by ensureTeachSkillInstalled().
  */
 export function createWorkspace(topicName) {
@@ -101,8 +101,14 @@ export function createWorkspace(topicName) {
   mkdirSync(directoryPath, { recursive: true });
 
   const agentsFilePath = join(directoryPath, "AGENTS.md");
-  if (!existsSync(agentsFilePath)) {
-    writeFileSync(agentsFilePath, COMPANION_RULES + "\n");
+  const expectedAgentsFileContent = COMPANION_WORKSPACE_NOTES + "\n";
+  const currentAgentsFileContent = existsSync(agentsFilePath)
+    ? readFileSync(agentsFilePath, "utf8")
+    : null;
+  // Heal older workspaces with the fatter persona automatically, and keep
+  // Codex workspace notes in lockstep with the code.
+  if (currentAgentsFileContent !== expectedAgentsFileContent) {
+    writeFileSync(agentsFilePath, expectedAgentsFileContent);
   }
 
   if (!alreadyExisted) {

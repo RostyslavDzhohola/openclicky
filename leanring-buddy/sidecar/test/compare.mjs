@@ -63,6 +63,10 @@ function newRequestId(runName, suffix) {
   return `${runName}-${suffix}-${Date.now()}`;
 }
 
+function chatModelForBackend(backend) {
+  return backend === "claude" ? "claude-sonnet-4-6" : "default";
+}
+
 class SidecarProcess {
   constructor(runName, sidecarEnvironment) {
     this.runName = runName;
@@ -192,7 +196,7 @@ async function runSidecarTeachComparison(runName, backend) {
       type: "chat",
       backend,
       workspaceId: "spanish-for-travel",
-      model: "claude-sonnet-4-6",
+      model: chatModelForBackend(backend),
       text: missionText,
       images: [],
       teachIntent: true,
