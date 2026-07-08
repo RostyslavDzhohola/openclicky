@@ -7,6 +7,7 @@
 //  like Loom's recording panel — dark, rounded, minimal, and special.
 //
 
+import AVFoundation
 import SwiftUI
 
 struct CompanionPanelView: View {
