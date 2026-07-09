@@ -124,10 +124,6 @@ export function createWorkspace(topicName) {
   return describeWorkspace(workspaceId);
 }
 
-export function ensureGeneralWorkspaceExists() {
-  createWorkspace(GENERAL_WORKSPACE_ID);
-}
-
 export function describeWorkspace(workspaceId) {
   const metadata = readWorkspaceMetadata(workspaceId) ?? {};
   const lessonsDirectory = join(workspacePath(workspaceId), "lessons");

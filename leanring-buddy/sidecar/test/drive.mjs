@@ -11,9 +11,10 @@
 //   node test/drive.mjs auth
 //   node test/drive.mjs workspaces
 //   node test/drive.mjs resume [--backend ...]   (two sidecar processes, proves continuity)
+//   node test/drive.mjs split  [--backend ...]   (chat dispatch + background lesson creation)
 //
 // By default all state goes to throwaway dirs under $TMPDIR (clicky-drive-*).
-// Pass --real to use the real ~/Documents/Clicky Lessons + Application Support.
+// Pass --real to use the real ~/Documents/OpenClicky Lessons + Application Support.
 
 import { spawn } from "node:child_process";
 import { mkdtempSync } from "node:fs";

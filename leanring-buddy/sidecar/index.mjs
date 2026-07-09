@@ -97,11 +97,14 @@ async function dispatchTeachInstructions({ backend, model, effort, topicText, in
       teachIntent: true,
       onStatus: null,
     };
+    let turnResult;
     if (backend === "codex") {
-      await runCodexChatTurn(dispatchArguments);
+      turnResult = await runCodexChatTurn(dispatchArguments);
     } else {
-      await runClaudeChatTurn(dispatchArguments);
+      turnResult = await runClaudeChatTurn(dispatchArguments);
     }
+    const resultPreview = String(turnResult?.text ?? "").slice(0, 200);
+    emitLog("info", `teach dispatch for ${workspace.id} finished: ${resultPreview}`);
   } catch (dispatchError) {
     emitEvent({
       type: "teachError",
@@ -130,9 +133,14 @@ async function handleChatRequest(request) {
     emitEvent({ id: request.id, type: "status", ...statusUpdate });
   };
 
-  const turnText = isChatPlaneTurn
-    ? composeChatTurnText(request.text ?? "", buildTopicRosterText())
-    : request.text ?? "";
+  let turnText = request.text ?? "";
+  if (isChatPlaneTurn) {
+    try {
+      turnText = composeChatTurnText(turnText, buildTopicRosterText());
+    } catch (rosterError) {
+      emitLog("warn", `topic roster build failed: ${String(rosterError?.message ?? rosterError)}`);
+    }
+  }
 
   const chatTurnArguments = {
     requestId: request.id,

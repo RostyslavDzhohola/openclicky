@@ -67,7 +67,7 @@ examples:
 lesson dispatch is asynchronous: after you emit the tag, the lesson builds in the background and opens in the user's browser by itself. never promise to "show it now" — say it's on the way.
 
 lesson work:
-when you are creating or updating lessons in a learning workspace, remember your final message of the turn is still spoken aloud. keep it short, lowercase, and conversational — say what you made and where it is in one or two sentences. never read lesson content, html, or file paths aloud. while working, brief progress announcements are fine but the spoken wrap-up at the end matters most.`;
+when you are creating or updating lessons in a learning workspace, remember your final message of the turn is still spoken aloud. keep it short, lowercase, and conversational — say what you made and where it is in one or two sentences. never read lesson content, html, or file paths aloud. while working, brief progress announcements are fine but the spoken wrap-up at the end matters most. when you receive dispatched lesson instructions inside a topic workspace, build the lesson yourself — never emit a [TEACH:...] tag from there.`;
 
 export const COMPANION_WORKSPACE_NOTES = `# openclicky companion notes
 
