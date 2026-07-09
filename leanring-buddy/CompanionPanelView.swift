@@ -79,6 +79,9 @@ struct CompanionPanelView: View {
             // Pull the latest brain sign-in state each time the panel opens so its
             // rows reflect reality without a manual refresh.
             companionManager.refreshBrainAuthStatus()
+            // Re-read topics and lessons from disk so the lessons picker reflects
+            // any lessons created while the panel was closed.
+            companionManager.refreshLessonTopicListings()
         }
     }
 
@@ -885,9 +888,10 @@ struct CompanionPanelView: View {
 
     // MARK: - Lessons
 
-    /// One button that opens the static lessons dashboard in the browser.
-    /// Topics are managed entirely by voice ("teach me …"); lessons are found
-    /// by navigation, not conversation.
+    /// A picker that lists every learning topic and its lessons; picking a lesson
+    /// opens that lesson's HTML directly, and a final item still opens the full
+    /// static dashboard. Topics are managed entirely by voice ("teach me …");
+    /// lessons are found by navigation, not conversation.
     private var lessonsSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
@@ -897,9 +901,7 @@ struct CompanionPanelView: View {
 
                 Spacer()
 
-                topicActionButton(title: "Open lessons") {
-                    companionManager.openLessonsDashboard()
-                }
+                lessonsMenu
             }
 
             Text("say \"teach me …\" to start a topic")
@@ -909,19 +911,55 @@ struct CompanionPanelView: View {
         .padding(.vertical, 4)
     }
 
-    private func topicActionButton(title: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(DS.Colors.textTertiary)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(
-                    RoundedRectangle(cornerRadius: 5, style: .continuous)
-                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
-                )
+    /// Borderless menu that mirrors the old topic picker's styling. Each topic is
+    /// a nested submenu of its lessons; a divider then an "All lessons" item keeps
+    /// the full dashboard reachable.
+    private var lessonsMenu: some View {
+        Menu {
+            if companionManager.lessonTopicListings.isEmpty {
+                Text("no lessons yet")
+            } else {
+                ForEach(companionManager.lessonTopicListings) { topic in
+                    Menu(topic.displayName) {
+                        ForEach(topic.lessons) { lesson in
+                            Button(lesson.displayTitle) {
+                                companionManager.openLesson(lesson)
+                            }
+                        }
+                    }
+                }
+            }
+
+            Divider()
+
+            Button("All lessons (dashboard)") {
+                companionManager.openLessonsDashboard()
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text("Open lessons")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(DS.Colors.textPrimary)
+                    .lineLimit(1)
+
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(DS.Colors.textTertiary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.white.opacity(0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+            )
         }
-        .buttonStyle(.plain)
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
         .pointerCursor()
     }
 

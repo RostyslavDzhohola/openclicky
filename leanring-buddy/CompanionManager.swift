@@ -21,6 +21,28 @@ enum CompanionVoiceState {
     case responding
 }
 
+/// One learning topic (a workspace folder under the lessons root) together with
+/// the individual lesson HTML files it contains. Powers the in-panel lessons
+/// picker so the user can open a specific lesson instead of the whole dashboard.
+struct LessonTopicListing: Identifiable {
+    /// The topic's folder name (its slug), which is also its stable identity.
+    let id: String
+    /// Human-readable topic name shown in the picker (from `.clicky.json` when
+    /// available, otherwise the folder name).
+    let displayName: String
+    let lessons: [LessonListing]
+}
+
+/// One lesson HTML file inside a topic's `lessons/` directory.
+struct LessonListing: Identifiable {
+    /// The lesson's file name, which uniquely identifies it within a topic.
+    let id: String
+    /// The file name cleaned up for display — the leading `NNNN-` ordering
+    /// prefix and the `.html` suffix are removed and hyphens become spaces.
+    let displayTitle: String
+    let fileURL: URL
+}
+
 @MainActor
 final class CompanionManager: ObservableObject {
     @Published private(set) var voiceState: CompanionVoiceState = .idle
@@ -183,6 +205,121 @@ final class CompanionManager: ObservableObject {
         NSWorkspace.shared.open(URL(fileURLWithPath: dashboardPath))
     }
 
+    /// The learning topics and their lessons, as read from disk, that back the
+    /// panel's in-panel lessons picker. Refreshed when the panel opens and when
+    /// the sidecar reports a newly created lesson.
+    @Published private(set) var lessonTopicListings: [LessonTopicListing] = []
+
+    /// Opens a single lesson's HTML file in the user's default browser.
+    func openLesson(_ lesson: LessonListing) {
+        NSWorkspace.shared.open(lesson.fileURL)
+    }
+
+    /// Rebuilds `lessonTopicListings` by enumerating the lessons root on disk.
+    ///
+    /// The lessons root is the parent directory of the sidecar's reported
+    /// dashboard path once it is available, otherwise the default install
+    /// location (so the picker still works before the sidecar is ready). Each
+    /// non-hidden subdirectory other than the "general" chat workspace is a
+    /// topic; a topic contributes to the picker only when it has at least one
+    /// lesson HTML file. This method deliberately never throws — any filesystem
+    /// problem simply leaves the list empty and logs a warning — because it runs
+    /// off UI events where a thrown error would have nowhere useful to go.
+    func refreshLessonTopicListings() {
+        let fileManager = FileManager.default
+
+        let lessonsRootDirectory: URL
+        if let dashboardPath = sidecarManager.lessonsDashboardPath {
+            lessonsRootDirectory = URL(fileURLWithPath: dashboardPath).deletingLastPathComponent()
+        } else {
+            lessonsRootDirectory = fileManager
+                .homeDirectoryForCurrentUser
+                .appendingPathComponent("Documents/OpenClicky Lessons")
+        }
+
+        guard let topicDirectoryEntries = try? fileManager.contentsOfDirectory(
+            at: lessonsRootDirectory,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            print("⚠️ Clicky: could not read lessons root at \(lessonsRootDirectory.path)")
+            lessonTopicListings = []
+            return
+        }
+
+        var topicListings: [LessonTopicListing] = []
+
+        for topicDirectoryURL in topicDirectoryEntries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            let isDirectory = (try? topicDirectoryURL.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            guard isDirectory else { continue }
+
+            let topicFolderName = topicDirectoryURL.lastPathComponent
+            // Hidden dot-directories (e.g. the ephemeral `.chat` workspace) and
+            // the "general" chat workspace are not lesson-bearing topics.
+            guard !topicFolderName.hasPrefix("."), topicFolderName != "general" else { continue }
+
+            let lessonsDirectoryURL = topicDirectoryURL.appendingPathComponent("lessons")
+            guard let lessonFileURLs = try? fileManager.contentsOfDirectory(
+                at: lessonsDirectoryURL,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) else { continue }
+
+            let lessonListings = lessonFileURLs
+                .filter { $0.pathExtension == "html" }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+                .map { lessonFileURL -> LessonListing in
+                    LessonListing(
+                        id: lessonFileURL.lastPathComponent,
+                        displayTitle: Self.lessonDisplayTitle(fromFileName: lessonFileURL.lastPathComponent),
+                        fileURL: lessonFileURL
+                    )
+                }
+
+            // Skip topics that have no lessons yet — they'd be empty submenus.
+            guard !lessonListings.isEmpty else { continue }
+
+            topicListings.append(
+                LessonTopicListing(
+                    id: topicFolderName,
+                    displayName: Self.topicDisplayName(forFolderURL: topicDirectoryURL, folderName: topicFolderName),
+                    lessons: lessonListings
+                )
+            )
+        }
+
+        lessonTopicListings = topicListings
+    }
+
+    /// Reads a topic's human-readable name from its `.clicky.json` metadata file,
+    /// falling back to the folder name when the file is missing or unreadable.
+    private static func topicDisplayName(forFolderURL topicDirectoryURL: URL, folderName: String) -> String {
+        let metadataFileURL = topicDirectoryURL.appendingPathComponent(".clicky.json")
+        guard
+            let metadataData = try? Data(contentsOf: metadataFileURL),
+            let parsedMetadata = try? JSONSerialization.jsonObject(with: metadataData) as? [String: Any],
+            let topicName = parsedMetadata["name"] as? String,
+            !topicName.isEmpty
+        else {
+            return folderName
+        }
+        return topicName
+    }
+
+    /// Cleans up a lesson HTML file name for display: drops the leading `NNNN-`
+    /// ordering prefix and the `.html` suffix, then turns hyphens into spaces.
+    private static func lessonDisplayTitle(fromFileName lessonFileName: String) -> String {
+        var title = lessonFileName
+        if title.hasSuffix(".html") {
+            title = String(title.dropLast(".html".count))
+        }
+        // Strip a leading numeric ordering prefix like "0003-".
+        if let prefixRange = title.range(of: #"^\d+-"#, options: .regularExpression) {
+            title.removeSubrange(prefixRange)
+        }
+        return title.replacingOccurrences(of: "-", with: " ")
+    }
+
     private var selectedModelAlias: String {
         selectedModel.contains("opus") ? "opus" : "sonnet"
     }
@@ -233,7 +370,14 @@ final class CompanionManager: ObservableObject {
             if lesson.openedByAgent == false {
                 NSWorkspace.shared.open(URL(fileURLWithPath: lesson.path))
             }
+            // A new lesson just landed on disk — refresh the picker so it appears
+            // in the panel without waiting for the panel to be reopened.
+            self.refreshLessonTopicListings()
         }
+
+        // Populate the lessons picker once at startup so it's ready the first
+        // time the panel opens.
+        refreshLessonTopicListings()
 
         sidecarManager.onTeachError = { [weak self] teachError in
             guard let self else { return }
