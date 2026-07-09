@@ -331,8 +331,22 @@ async function runResumeDrive() {
 async function runSplitDrive() {
   const sidecar = await startSidecar();
 
+  const createRequestId = newRequestId();
+  sidecar.send({ id: createRequestId, type: "createWorkspace", name: "drive split topic" });
+  const createCompletion = await sidecar.waitForCompletion(createRequestId, 120_000);
+  assertCondition(
+    createCompletion.type === "result",
+    "createWorkspace failed: " + (createCompletion.message ?? "")
+  );
+  assertCondition(
+    createCompletion.workspace?.id === "drive-split-topic",
+    "unexpected workspace id: " + (createCompletion.workspace?.id ?? "none")
+  );
+
   // 1. Chat-plane turn instructed to emit the extended tag verbatim, so the
   //    routing is tested without depending on the model's own intent detection.
+  //    The topic must pre-exist because companion rules forbid tagging
+  //    unrostered topics; ask-before-create would otherwise intercept.
   const chatRequestId = newRequestId();
   sidecar.send({
     id: chatRequestId,
@@ -341,7 +355,7 @@ async function runSplitDrive() {
     model: chatModelForBackend(backend),
     effort: "low",
     text:
-      'this is a routing test. reply with one short sentence and end your reply with exactly this tag, verbatim: [TEACH:drive-split-topic:create a one-page hello lesson that says hello world]',
+      'this is a routing test. the topic drive-split-topic already exists in your roster. reply with one short sentence and end your reply with exactly this tag, verbatim: [TEACH:drive-split-topic:create a one-page hello lesson that says hello world]',
     images: [],
   });
   const chatCompletion = await sidecar.waitForCompletion(chatRequestId, 300_000);
