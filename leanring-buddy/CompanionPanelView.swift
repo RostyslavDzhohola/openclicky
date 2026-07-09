@@ -76,9 +76,8 @@ struct CompanionPanelView: View {
         .frame(width: 320)
         .background(panelBackground)
         .onAppear {
-            // Pull the latest topic list and brain sign-in state each time the
-            // panel opens so its rows reflect reality without a manual refresh.
-            companionManager.refreshWorkspaces()
+            // Pull the latest brain sign-in state each time the panel opens so its
+            // rows reflect reality without a manual refresh.
             companionManager.refreshBrainAuthStatus()
         }
     }
@@ -87,7 +86,8 @@ struct CompanionPanelView: View {
 
     /// Groups the brain status and picker rows shown once the user is onboarded
     /// and fully permissioned. Order: status concerns first (sidecar health,
-    /// account sign-in), then the pickers (backend, model, topic).
+    /// account sign-in), then the pickers (backend, model, thinking), then the
+    /// lessons section.
     private var brainSection: some View {
         VStack(spacing: 4) {
             sidecarStatusRow
@@ -96,7 +96,7 @@ struct CompanionPanelView: View {
             backendPickerRow
             modelPickerRow
             thinkingPickerRow
-            topicPickerSection
+            lessonsSection
         }
     }
 
@@ -883,49 +883,30 @@ struct CompanionPanelView: View {
         SidecarStatusRow(sidecarManager: companionManager.sidecarManager)
     }
 
-    // MARK: - Topic Picker
+    // MARK: - Lessons
 
-    /// The learning-topic block: a labeled topic menu, the "Next lesson" /
-    /// "New chat" action buttons beneath it, and a first-run hint that nudges the
-    /// user toward starting their first topic by voice.
-    private var topicPickerSection: some View {
+    /// One button that opens the static lessons dashboard in the browser.
+    /// Topics are managed entirely by voice ("teach me …"); lessons are found
+    /// by navigation, not conversation.
+    private var lessonsSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("Learning topic")
+                Text("Lessons")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(DS.Colors.textSecondary)
 
                 Spacer()
 
-                topicMenu
-            }
-
-            topicActionButtons
-
-            if !hasNonGeneralTopics {
-                Text("say \"teach me …\" to start a topic")
-                    .font(.system(size: 10))
-                    .foregroundColor(DS.Colors.textTertiary)
-            }
-        }
-        .padding(.vertical, 4)
-    }
-
-    /// "New chat" starts a fresh conversation for the current backend + topic; it
-    /// is always available. "Next lesson" only makes sense inside a real topic, so
-    /// it sits beside "New chat" whenever a non-general topic is selected.
-    private var topicActionButtons: some View {
-        HStack(spacing: 8) {
-            if companionManager.selectedWorkspaceId != "general" {
-                topicActionButton(title: "Next lesson") {
-                    companionManager.requestNextLesson()
+                topicActionButton(title: "Open lessons") {
+                    companionManager.openLessonsDashboard()
                 }
             }
 
-            topicActionButton(title: "New chat") {
-                companionManager.resetCurrentConversation()
-            }
+            Text("say \"teach me …\" to start a topic")
+                .font(.system(size: 10))
+                .foregroundColor(DS.Colors.textTertiary)
         }
+        .padding(.vertical, 4)
     }
 
     private func topicActionButton(title: String, action: @escaping () -> Void) -> some View {
@@ -942,69 +923,6 @@ struct CompanionPanelView: View {
         }
         .buttonStyle(.plain)
         .pointerCursor()
-    }
-
-    /// Whether the learner has started at least one real topic beyond the default
-    /// general workspace. Drives the first-run "say teach me …" hint.
-    private var hasNonGeneralTopics: Bool {
-        companionManager.workspaces.contains { $0.id != "general" }
-    }
-
-    private var topicMenu: some View {
-        Menu {
-            ForEach(companionManager.workspaces) { workspace in
-                Button(action: {
-                    companionManager.setSelectedWorkspaceId(workspace.id)
-                }) {
-                    if companionManager.selectedWorkspaceId == workspace.id {
-                        Label(topicMenuLabel(for: workspace), systemImage: "checkmark")
-                    } else {
-                        Text(topicMenuLabel(for: workspace))
-                    }
-                }
-            }
-        } label: {
-            HStack(spacing: 4) {
-                Text(selectedWorkspaceName)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(DS.Colors.textPrimary)
-                    .lineLimit(1)
-
-                Image(systemName: "chevron.up.chevron.down")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundColor(DS.Colors.textTertiary)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.white.opacity(0.06))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
-            )
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .pointerCursor()
-    }
-
-    /// Display name for the currently selected topic, falling back to "General"
-    /// when no matching workspace is loaded (the default general workspace).
-    private var selectedWorkspaceName: String {
-        companionManager.workspaces
-            .first(where: { $0.id == companionManager.selectedWorkspaceId })?
-            .name ?? "General"
-    }
-
-    private func topicMenuLabel(for workspace: SidecarWorkspace) -> String {
-        // The default general workspace isn't a lesson-bearing topic, so it shows
-        // just its name; real topics carry an "— N lessons" subtitle.
-        guard workspace.id != "general" else { return workspace.name }
-        let lessonNoun = workspace.lessonCount == 1 ? "lesson" : "lessons"
-        return "\(workspace.name) — \(workspace.lessonCount) \(lessonNoun)"
     }
 
     // MARK: - DM Farza Button
