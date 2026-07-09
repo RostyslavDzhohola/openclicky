@@ -150,35 +150,41 @@ async function handleChatRequest(request) {
     clearTimeout(chatIdleResetTimer);
   }
 
-  const turnResult =
-    request.backend === "codex"
-      ? await runCodexChatTurn(chatTurnArguments)
-      : await runClaudeChatTurn(chatTurnArguments);
+  try {
+    const turnResult =
+      request.backend === "codex"
+        ? await runCodexChatTurn(chatTurnArguments)
+        : await runClaudeChatTurn(chatTurnArguments);
 
-  let responseText = turnResult.text;
-  if (isChatPlaneTurn) {
-    armChatIdleReset();
-    const { cleanedText, dispatch } = parseTeachTag(responseText);
-    responseText = cleanedText;
-    if (dispatch) {
-      // Fire-and-forget: a minutes-long lesson build never blocks the chat.
-      void dispatchTeachInstructions({
-        backend: request.backend,
-        model: request.model,
-        effort: request.effort,
-        topicText: dispatch.topicText,
-        instructions: dispatch.instructions,
-      });
+    let responseText = turnResult.text;
+    if (isChatPlaneTurn) {
+      const { cleanedText, dispatch } = parseTeachTag(responseText);
+      responseText = cleanedText;
+      if (dispatch) {
+        // Fire-and-forget: a minutes-long lesson build never blocks the chat.
+        void dispatchTeachInstructions({
+          backend: request.backend,
+          model: request.model,
+          effort: request.effort,
+          topicText: dispatch.topicText,
+          instructions: dispatch.instructions,
+        });
+      }
+    }
+
+    emitEvent({
+      id: request.id,
+      type: "result",
+      text: responseText,
+      sessionId: turnResult.sessionId ?? null,
+      durationMs: turnResult.durationMs ?? null,
+    });
+  } finally {
+    if (isChatPlaneTurn) {
+      // A turn that fails or is cancelled still ends activity — the idle window must re-arm or ephemerality is lost.
+      armChatIdleReset();
     }
   }
-
-  emitEvent({
-    id: request.id,
-    type: "result",
-    text: responseText,
-    sessionId: turnResult.sessionId ?? null,
-    durationMs: turnResult.durationMs ?? null,
-  });
 }
 
 async function handleOneShotRequest(request) {
