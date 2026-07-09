@@ -75,7 +75,7 @@ function armChatIdleReset() {
  * teachError event the app speaks, and success surfaces as the existing
  * lessonCreated event from the watcher.
  */
-async function dispatchTeachInstructions({ backend, model, effort, topicText, instructions }) {
+async function dispatchTeachInstructions({ backend, model, topicText, instructions }) {
   let workspace;
   try {
     workspace = createWorkspace(topicText);
@@ -87,12 +87,21 @@ async function dispatchTeachInstructions({ backend, model, effort, topicText, in
     regenerateLessonsDashboard();
     watchWorkspaceLessons(workspace.id, backend);
 
+    // Lesson quality beats latency: dispatched teach turns always use the
+    // deepest reasoning tier the backend accepts, regardless of the panel's
+    // thinking setting. The chat plane keeps the user's own configuration.
+    const lessonEffortLevel = backend === "codex" ? "xhigh" : "max";
+
+    const groundedInstructions =
+      instructions +
+      "\n\nbefore writing the lesson, use web search to ground your understanding of this topic in current, accurate information — verify key facts and examples rather than relying on memory.";
+
     const dispatchArguments = {
       requestId: `teach-dispatch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       workspaceId: workspace.id,
       model,
-      effort,
-      text: instructions,
+      effort: lessonEffortLevel,
+      text: groundedInstructions,
       images: [],
       teachIntent: true,
       onStatus: null,
@@ -173,7 +182,6 @@ async function handleChatRequest(request) {
         void dispatchTeachInstructions({
           backend: request.backend,
           model: request.model,
-          effort: request.effort,
           topicText: dispatch.topicText,
           instructions: dispatch.instructions,
         });
