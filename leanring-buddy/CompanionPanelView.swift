@@ -696,14 +696,19 @@ struct CompanionPanelView: View {
     }
 
     /// The display name shown on the menu's label: the pinned microphone's name
-    /// when one is selected and still connected, otherwise "System default".
+    /// when one is selected and still connected, "System default" when nothing is
+    /// pinned, and an explicit unavailable notice when the pinned microphone is
+    /// currently disconnected (the pin stays persisted).
     private var selectedMicrophoneDisplayName: String {
         guard let selectedMicrophoneUID = companionManager.selectedMicrophoneUID else {
             return "System default"
         }
         let matchingMicrophone = companionManager.availableMicrophones
             .first { $0.id == selectedMicrophoneUID }
-        return matchingMicrophone?.displayName ?? "System default"
+        // A pin exists but its device is not connected right now: be honest that
+        // capture is falling back while the pin itself is still persisted — a
+        // plain "System default" would misrepresent the pin as cleared.
+        return matchingMicrophone?.displayName ?? "Unavailable — using system default"
     }
 
     /// Borderless menu mirroring the lessons menu's styling. Lists "System

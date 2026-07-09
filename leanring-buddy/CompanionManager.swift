@@ -313,8 +313,10 @@ final class CompanionManager: ObservableObject {
     /// Pins a specific microphone by UID (or clears the pin with `nil`). The
     /// change takes effect on the next push-to-talk turn; no restart needed.
     func setSelectedMicrophoneUID(_ selectedMicrophoneUID: String?) {
-        buddyDictationManager.setPreferredMicrophoneUID(selectedMicrophoneUID)
+        // Will-change convention: signal observers BEFORE the underlying value
+        // mutates so SwiftUI snapshots the old state and re-reads the new one.
         objectWillChange.send()
+        buddyDictationManager.setPreferredMicrophoneUID(selectedMicrophoneUID)
     }
 
     /// Reads a topic's human-readable name from its `.clicky.json` metadata file,

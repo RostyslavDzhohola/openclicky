@@ -8,6 +8,11 @@
 //
 
 import AppKit
+// AudioUnitSetProperty and kAudioOutputUnitProperty_CurrentDevice are declared
+// in AudioToolbox; without this explicit import they only compile via
+// AVFoundation's transitive import, which is brittle under Swift 6
+// MemberImportVisibility.
+import AudioToolbox
 import AVFoundation
 import Combine
 import CoreAudio
@@ -294,6 +299,12 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     /// Timestamp of the last completed permission request, used to debounce
     /// rapid follow-up requests that arrive before macOS updates its cache.
     private var lastPermissionRequestCompletedAt: Date?
+    /// The device we last pinned onto the input node's AUHAL this app run, if
+    /// any. The engine is cached for the app's lifetime, so a pin outlives the
+    /// session that set it — we track it so that clearing the preference (or the
+    /// pinned mic vanishing) actively restores the system default input instead
+    /// of leaving the AUHAL stuck on the old (possibly dead) device.
+    private var lastAppliedMicrophoneOverrideDeviceID: AudioDeviceID?
 
     override init() {
         let transcriptionProvider = BuddyTranscriptionProviderFactory.makeDefaultProvider()
@@ -372,38 +383,96 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         return resolvedDeviceID
     }
 
-    /// Applies the user's pinned-microphone preference to the shared audio
-    /// engine's input node BEFORE the tap format is read, so the tap picks up the
-    /// chosen device's native format. Re-applied at every session start so a
-    /// changed selection (or a device that came back) takes effect on the next
-    /// push-to-talk without an app restart. Silently falls back to the system
-    /// default input (with a printed warning) when no preference is set or the
-    /// pinned device can no longer be resolved.
-    private func applyPreferredMicrophoneOverrideToInputNode() {
-        guard let preferredMicrophoneUID = preferredMicrophoneUID(), !preferredMicrophoneUID.isEmpty else {
-            return
-        }
+    /// Reads the system's current default input device from CoreAudio, or `nil`
+    /// on failure. Used to actively restore default routing after a previously
+    /// applied override is cleared — we cannot just "not set" the device because
+    /// the cached engine's AUHAL keeps whatever device was last pinned.
+    private func systemDefaultInputDeviceID() -> AudioDeviceID? {
+        var defaultInputAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var defaultInputDeviceID = AudioDeviceID(kAudioObjectUnknown)
+        var defaultInputDeviceIDSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let readStatus = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &defaultInputAddress,
+            0,
+            nil,
+            &defaultInputDeviceIDSize,
+            &defaultInputDeviceID
+        )
+        guard readStatus == noErr, defaultInputDeviceID != kAudioObjectUnknown else { return nil }
+        return defaultInputDeviceID
+    }
 
-        guard var resolvedDeviceID = audioDeviceID(forUID: preferredMicrophoneUID) else {
-            print("⚠️ BuddyDictationManager: preferred microphone \(preferredMicrophoneUID) is unavailable; using system default input")
-            return
-        }
-
+    /// Sets a specific device on the input node's AUHAL. Returns whether the
+    /// property write succeeded.
+    private func setInputNodeCaptureDevice(_ captureDeviceID: AudioDeviceID) -> Bool {
         guard let inputAudioUnit = audioEngine.inputNode.audioUnit else {
-            print("⚠️ BuddyDictationManager: input node has no audio unit; using system default input")
-            return
+            print("⚠️ BuddyDictationManager: input node has no audio unit; cannot set capture device")
+            return false
         }
 
+        var mutableCaptureDeviceID = captureDeviceID
         let setDeviceStatus = AudioUnitSetProperty(
             inputAudioUnit,
             kAudioOutputUnitProperty_CurrentDevice,
             kAudioUnitScope_Global,
             0,
-            &resolvedDeviceID,
+            &mutableCaptureDeviceID,
             UInt32(MemoryLayout<AudioDeviceID>.size)
         )
-        if setDeviceStatus != noErr {
-            print("⚠️ BuddyDictationManager: failed to pin microphone \(preferredMicrophoneUID) (status \(setDeviceStatus)); using system default input")
+        return setDeviceStatus == noErr
+    }
+
+    /// Applies the user's pinned-microphone preference to the shared audio
+    /// engine's input node BEFORE the tap format is read, so the tap picks up the
+    /// chosen device's native format. Re-applied at every session start so a
+    /// changed selection (or a device that came back) takes effect on the next
+    /// push-to-talk without an app restart.
+    ///
+    /// When no preference is set (or the pinned mic can no longer be resolved)
+    /// AND we previously pinned a device this app run, we must actively re-point
+    /// the AUHAL at the current system default input: the engine is cached, so
+    /// the old pin would otherwise persist — reverting to "System default" would
+    /// silently keep the previous device, and an unplugged pinned mic would
+    /// strand the AUHAL on a dead AudioDeviceID. When no override was ever
+    /// applied we deliberately set nothing, so the AUHAL keeps following the
+    /// system default automatically (pinning the current default's fixed id
+    /// would disable that follow behaviour).
+    private func applyPreferredMicrophoneOverrideToInputNode() {
+        let preferredMicrophoneUID = preferredMicrophoneUID()
+        let resolvedPreferredDeviceID: AudioDeviceID?
+        if let preferredMicrophoneUID, !preferredMicrophoneUID.isEmpty {
+            resolvedPreferredDeviceID = audioDeviceID(forUID: preferredMicrophoneUID)
+            if resolvedPreferredDeviceID == nil {
+                print("⚠️ BuddyDictationManager: preferred microphone \(preferredMicrophoneUID) is unavailable; using system default input")
+            }
+        } else {
+            resolvedPreferredDeviceID = nil
+        }
+
+        guard let preferredDeviceID = resolvedPreferredDeviceID else {
+            // No usable preference. Restore default routing only if we pinned a
+            // device earlier this app run; otherwise leave the AUHAL untouched so
+            // it keeps auto-following the system default.
+            if lastAppliedMicrophoneOverrideDeviceID != nil {
+                if let defaultInputDeviceID = systemDefaultInputDeviceID(),
+                   setInputNodeCaptureDevice(defaultInputDeviceID) {
+                    lastAppliedMicrophoneOverrideDeviceID = nil
+                } else {
+                    print("⚠️ BuddyDictationManager: failed to restore the system default input after clearing the microphone pin")
+                }
+            }
+            return
+        }
+
+        if setInputNodeCaptureDevice(preferredDeviceID) {
+            lastAppliedMicrophoneOverrideDeviceID = preferredDeviceID
+        } else {
+            print("⚠️ BuddyDictationManager: failed to pin microphone \(preferredMicrophoneUID ?? "?") (device \(preferredDeviceID)); using system default input")
         }
     }
 
