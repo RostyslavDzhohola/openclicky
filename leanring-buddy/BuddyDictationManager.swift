@@ -299,11 +299,14 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     /// Timestamp of the last completed permission request, used to debounce
     /// rapid follow-up requests that arrive before macOS updates its cache.
     private var lastPermissionRequestCompletedAt: Date?
-    /// The device we last pinned onto the input node's AUHAL this app run, if
-    /// any. The engine is cached for the app's lifetime, so a pin outlives the
-    /// session that set it — we track it so that clearing the preference (or the
-    /// pinned mic vanishing) actively restores the system default input instead
-    /// of leaving the AUHAL stuck on the old (possibly dead) device.
+    /// The device we last explicitly set on the input node's AUHAL this app run
+    /// (a user pin, or the default input re-applied after a pin was cleared).
+    /// The engine is cached for the app's lifetime, so any explicit device set
+    /// outlives the session that made it AND permanently disables the AUHAL's
+    /// automatic default-follow. While this is non-nil, every nil-preference
+    /// session start re-resolves and re-applies the current system default to
+    /// emulate default-follow per session; it stays nil only while the AUHAL has
+    /// never been touched and still follows the default on its own.
     private var lastAppliedMicrophoneOverrideDeviceID: AudioDeviceID?
 
     override init() {
@@ -455,13 +458,21 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         }
 
         guard let preferredDeviceID = resolvedPreferredDeviceID else {
-            // No usable preference. Restore default routing only if we pinned a
-            // device earlier this app run; otherwise leave the AUHAL untouched so
+            // No usable preference. Restore default routing only if we ever set
+            // a device on the AUHAL this app run; otherwise leave it untouched so
             // it keeps auto-following the system default.
+            //
+            // The tracker intentionally STAYS set after a successful restore:
+            // explicitly setting any device (even the default's id) disables the
+            // AUHAL's automatic default-follow permanently for the cached engine,
+            // so we emulate that follow behaviour per session — every subsequent
+            // nil-preference session re-resolves and re-applies the CURRENT
+            // default input here. Clearing the tracker would freeze capture on a
+            // snapshot of one moment's default device.
             if lastAppliedMicrophoneOverrideDeviceID != nil {
                 if let defaultInputDeviceID = systemDefaultInputDeviceID(),
                    setInputNodeCaptureDevice(defaultInputDeviceID) {
-                    lastAppliedMicrophoneOverrideDeviceID = nil
+                    lastAppliedMicrophoneOverrideDeviceID = defaultInputDeviceID
                 } else {
                     print("⚠️ BuddyDictationManager: failed to restore the system default input after clearing the microphone pin")
                 }
