@@ -125,18 +125,6 @@ final class CompanionManager: ObservableObject {
         UserDefaults.standard.set(backend, forKey: "selectedBrainBackend")
     }
 
-    @Published var selectedWorkspaceId: String = UserDefaults.standard.string(forKey: "selectedWorkspaceId") ?? "general"
-
-    func setSelectedWorkspaceId(_ workspaceId: String) {
-        selectedWorkspaceId = workspaceId
-        UserDefaults.standard.set(workspaceId, forKey: "selectedWorkspaceId")
-    }
-
-    /// The learning workspaces (topics) known to the brain sidecar, shown in
-    /// the panel's topic picker. Refreshed when the panel appears and whenever
-    /// a lesson is created.
-    @Published private(set) var workspaces: [SidecarWorkspace] = []
-
     /// The latest brain authentication status for both backends, shown in the
     /// panel. Nil until the first successful check completes.
     @Published private(set) var brainAuthStatus: SidecarAuthStatus?
@@ -154,19 +142,6 @@ final class CompanionManager: ObservableObject {
     /// override the panel's "Signed in" line until the next turn is attempted.
     @Published private(set) var authRequiredPanelMessage: (backend: String, message: String)?
 
-    /// Reloads the topic list from the sidecar. Errors are swallowed into a
-    /// printed log — the panel simply keeps showing whatever it had before.
-    func refreshWorkspaces() {
-        Task {
-            do {
-                let listedWorkspaces = try await sidecarManager.listWorkspaces()
-                workspaces = listedWorkspaces
-            } catch {
-                print("⚠️ Clicky: failed to refresh workspaces: \(error)")
-            }
-        }
-    }
-
     /// Reloads the brain authentication status from the sidecar. Errors are
     /// swallowed into a printed log so the panel just shows stale data.
     func refreshBrainAuthStatus() {
@@ -176,22 +151,6 @@ final class CompanionManager: ObservableObject {
                 brainAuthStatus = latestBrainAuthStatus
             } catch {
                 print("⚠️ Clicky: failed to refresh brain auth status: \(error)")
-            }
-        }
-    }
-
-    func resetCurrentConversation() {
-        Task {
-            do {
-                let didReset = try await sidecarManager.resetSession(
-                    backend: selectedBackend,
-                    workspaceId: selectedWorkspaceId
-                )
-                if didReset {
-                    print("🧠 Clicky: reset \(selectedBackend) conversation for workspace \(selectedWorkspaceId)")
-                }
-            } catch {
-                print("⚠️ Clicky: failed to reset \(selectedBackend) conversation for workspace \(selectedWorkspaceId): \(error)")
             }
         }
     }
@@ -212,15 +171,16 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Asks the brain to author the next lesson for the currently selected
-    /// topic, based on the learner's records. Only meaningful in a real topic
-    /// workspace, so the general workspace is ignored.
-    func requestNextLesson() {
-        guard selectedWorkspaceId != "general" else { return }
-        sendTranscriptToClaudeWithScreenshot(
-            transcript: "create the next lesson for me based on my learning records",
-            teachIntent: true
-        )
+    /// Opens the static lessons dashboard the sidecar maintains at the lessons
+    /// root. Falls back to the default install location when the sidecar has
+    /// not reported a path yet (first launch before ready).
+    func openLessonsDashboard() {
+        let fallbackDashboardPath = FileManager.default
+            .homeDirectoryForCurrentUser
+            .appendingPathComponent("Documents/OpenClicky Lessons/index.html")
+            .path
+        let dashboardPath = sidecarManager.lessonsDashboardPath ?? fallbackDashboardPath
+        NSWorkspace.shared.open(URL(fileURLWithPath: dashboardPath))
     }
 
     private var selectedModelAlias: String {
@@ -267,14 +227,22 @@ final class CompanionManager: ObservableObject {
         ScreenshotFileStore.sweepStaleCaptures()
 
         // When the brain writes a new lesson, open it in the user's default
-        // editor unless the agent already opened it itself, then refresh the
-        // topic list so its lesson count updates in the panel.
+        // editor unless the agent already opened it itself.
         sidecarManager.onLessonCreated = { [weak self] lesson in
             guard let self else { return }
             if lesson.openedByAgent == false {
                 NSWorkspace.shared.open(URL(fileURLWithPath: lesson.path))
             }
-            self.refreshWorkspaces()
+        }
+
+        sidecarManager.onTeachError = { [weak self] teachError in
+            guard let self else { return }
+            print("⚠️ Companion teach dispatch failed for \(teachError.topicName): \(teachError.message)")
+            Task { @MainActor in
+                try? await self.textToSpeechClient.speakText(
+                    "hit a snag while building your \(teachError.topicName) lesson — mind trying that again?"
+                )
+            }
         }
 
         markOnboardingCompleteIfPermissionsReady()
@@ -552,7 +520,7 @@ final class CompanionManager: ObservableObject {
     /// the spinner/processing state until TTS audio begins playing.
     /// The brain response may include a [POINT:x,y:label] tag which triggers
     /// the buddy to fly to that element on screen.
-    private func sendTranscriptToClaudeWithScreenshot(transcript: String, teachIntent: Bool = false) {
+    private func sendTranscriptToClaudeWithScreenshot(transcript: String) {
         currentResponseTask?.cancel()
         textToSpeechClient.stopPlayback()
 
@@ -589,8 +557,6 @@ final class CompanionManager: ObservableObject {
                     backend: selectedBackend,
                     model: selectedBackend == "codex" ? selectedCodexModel : selectedModelAlias,
                     effort: selectedBackend == "codex" ? selectedCodexEffort : selectedClaudeEffort,
-                    workspaceId: selectedWorkspaceId,
-                    teachIntent: teachIntent,
                     onStatus: { [weak self] brainStatus in
                         // On the first tool-use of a turn, arm the long-turn
                         // spoken reassurance so quiet, slow turns don't feel dead.
@@ -607,10 +573,10 @@ final class CompanionManager: ObservableObject {
 
                 guard !Task.isCancelled else { return }
 
-                // Parse an optional trailing [TEACH:...] tag first, then run the
-                // existing [POINT:...] parsing on the tag-stripped text.
-                let teachParseResult = Self.parseTeachIntent(from: fullResponseText)
-                let parseResult = Self.parsePointingCoordinates(from: teachParseResult.cleanedText)
+                // Parse an optional trailing [POINT:...] tag. Teach routing now
+                // happens entirely inside the sidecar's chat plane — the app
+                // never sees a [TEACH:...] tag anymore.
+                let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
                 let spokenText = parseResult.spokenText
 
                 // Handle element pointing if the brain returned coordinates.
@@ -683,13 +649,6 @@ final class CompanionManager: ObservableObject {
                         speakGenericErrorFallback()
                     }
                 }
-
-                // If the brain signalled a "teach me this over time" intent,
-                // spin up (or reuse) the topic workspace and kick off the first
-                // lesson turn now that the acknowledgement is being spoken.
-                if let teachTopicName = teachParseResult.topicName {
-                    await beginTeachingTopic(teachTopicName)
-                }
             } catch is CancellationError {
                 // User spoke again — response was interrupted
                 longTurnAcknowledgementTask?.cancel()
@@ -726,40 +685,6 @@ final class CompanionManager: ObservableObject {
             } catch {
                 print("⚠️ Companion long-turn acknowledgement TTS error: \(error)")
             }
-        }
-    }
-
-    /// Creates (or reuses) the learning workspace for the requested topic, makes
-    /// it the active workspace, then kicks off the first lesson turn. The sidecar
-    /// dedupes by slug, so an existing topic folder is reused as-is. Any failure
-    /// falls back to the generic spoken error.
-    private func beginTeachingTopic(_ topicName: String) async {
-        do {
-            let workspace = try await sidecarManager.createWorkspace(name: topicName)
-            setSelectedWorkspaceId(workspace.id)
-
-            // Let the spoken acknowledgement finish before starting the lesson
-            // turn — starting a turn stops TTS playback, which would cut the
-            // acknowledgement off mid-sentence. Bail out if the user speaks
-            // again while we wait (this task gets cancelled).
-            while textToSpeechClient.isPlaying {
-                try? await Task.sleep(nanoseconds: 200_000_000)
-                guard !Task.isCancelled else { return }
-            }
-            guard !Task.isCancelled else { return }
-
-            // Pass just the topic, exactly like typing `/teach <topic>` in a
-            // terminal. The skill itself decides what happens next: with an
-            // empty MISSION.md it interviews the user first (spoken aloud,
-            // answered by voice in this same session) rather than jumping
-            // straight to a lesson.
-            sendTranscriptToClaudeWithScreenshot(
-                transcript: topicName,
-                teachIntent: true
-            )
-        } catch {
-            print("⚠️ Companion teach-start error: \(error)")
-            speakFallbackMessage(forTurnError: error)
         }
     }
 
@@ -897,31 +822,6 @@ final class CompanionManager: ObservableObject {
             elementLabel: elementLabel,
             screenNumber: screenNumber
         )
-    }
-
-    // MARK: - Teach Tag Parsing
-
-    /// Parses an optional trailing [TEACH:topic name] tag from the brain
-    /// response. The sidecar appends this at the very END of a response (after
-    /// any [POINT:...] tag) when the user asks to learn a topic over time.
-    /// Returns the response text with the tag stripped plus the extracted topic
-    /// name, or nil when no teach tag is present.
-    static func parseTeachIntent(from responseText: String) -> (cleanedText: String, topicName: String?) {
-        // Match a trailing [TEACH:topic name] tag, tolerant of trailing whitespace.
-        let pattern = #"\[TEACH:([^\]]+)\]\s*$"#
-
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: []),
-              let match = regex.firstMatch(in: responseText, range: NSRange(responseText.startIndex..., in: responseText)),
-              let tagRange = Range(match.range, in: responseText),
-              let topicRange = Range(match.range(at: 1), in: responseText) else {
-            // No teach tag found
-            return (cleanedText: responseText, topicName: nil)
-        }
-
-        let cleanedText = String(responseText[..<tagRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-        let topicName = String(responseText[topicRange]).trimmingCharacters(in: .whitespacesAndNewlines)
-
-        return (cleanedText: cleanedText, topicName: topicName.isEmpty ? nil : topicName)
     }
 
 }
