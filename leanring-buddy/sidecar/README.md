@@ -58,7 +58,15 @@ npm run drive:auth                                                   # login det
 npm run drive:resume -- --backend claude                             # context survives a sidecar restart
 npm run drive:teach -- --backend claude --topic "css flexbox"        # full lesson generation (minutes)
 npm run drive:workspaces                                             # workspace creation + listing
+npm run drive:split -- --backend codex                               # chat plane: TEACH dispatch + idle reset (minutes)
+
+npm test                                                             # fast unit tests (no model calls)
 ```
+
+The chat plane's inactivity reset defaults to 10 minutes; the drive sandbox
+shortens it to 3 seconds via `CLICKY_CHAT_IDLE_MS` so `drive:split` can prove
+the ephemeral session forgets. Each drive run gets fresh `mkdtemp` state dirs —
+stateful modes are only repeatable on a clean lessons root.
 
 Note: if you `npm install` here for terminal testing, this `node_modules` gets
 copied into dev app bundles by Xcode's synchronized folder (harmless, just

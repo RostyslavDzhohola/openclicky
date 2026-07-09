@@ -1,7 +1,7 @@
 # Chat vs. Learning Split — Design
 
 Date: 2026-07-08
-Status: approved pending user review
+Status: implemented 2026-07-09 (plan: docs/superpowers/plans/2026-07-09-chat-vs-learning-split.md)
 
 ## Vision
 

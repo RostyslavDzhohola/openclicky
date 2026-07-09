@@ -14,14 +14,14 @@ No API keys and no proxy server are required — the brains run on the user's ow
 - **App Type**: Menu bar-only (`LSUIElement=true`), no dock icon or main window
 - **Framework**: SwiftUI (macOS native) with AppKit bridging for menu bar panel and cursor overlay
 - **Pattern**: MVVM with `@StateObject` / `@Published` state management
-- **AI Brain**: Node.js sidecar (`leanring-buddy/sidecar/`) hosting the Claude Agent SDK (Claude Pro/Max login) and OpenAI Codex SDK (ChatGPT-plan login). One persistent session/thread per learning workspace per backend; ids persisted in each workspace's `.clicky.json` so context survives restarts. Backend switchable in the panel.
+- **AI Brain**: Node.js sidecar (`leanring-buddy/sidecar/`) hosting the Claude Agent SDK (Claude Pro/Max login) and OpenAI Codex SDK (ChatGPT-plan login). Two planes: every voice turn runs in a hidden ephemeral chat workspace (`.chat` under the lessons root) that resets on app restart and after ~10 idle minutes (`CLICKY_CHAT_IDLE_MS`); topic workspaces keep one persistent session/thread per backend with ids in `.clicky.json` so lesson context survives restarts. Backend switchable in the panel.
 - **Speech-to-Text**: Apple Speech on-device (default). AssemblyAI streaming and OpenAI upload providers remain selectable via the `VoiceTranscriptionProvider` Info.plist key.
 - **Text-to-Speech**: `AVSpeechSynthesizer` local voice (default) behind the `CompanionTTSClient` protocol; `ElevenLabsTTSClient` conforms too for the legacy hosted path.
-- **Stateful Learning**: the unmodified teach skill (installed once via `npx skills` into a template, file-copied per workspace) runs in per-topic folders under `~/Documents/OpenClicky Lessons/`. A chokidar watcher emits `lessonCreated` events; the app opens the lesson HTML unless the agent already did (`openedByAgent` dedupe).
+- **Stateful Learning**: the unmodified teach skill (installed once via `npx skills` into a template, file-copied per workspace) runs in per-topic folders under `~/Documents/OpenClicky Lessons/`. The user never talks directly into a topic session — topics are driven only by TEACH dispatches from the chat plane. A chokidar watcher emits `lessonCreated` events (the app opens the lesson HTML unless the agent already did — `openedByAgent` dedupe) and regenerates a static `index.html` dashboard at the lessons root; the panel's "Lessons" button opens it.
 - **Screen Capture**: ScreenCaptureKit (macOS 14.2+), multi-monitor support. Captures are written to per-turn temp files (`ScreenshotFileStore`) so both SDKs can read them.
 - **Voice Input**: Push-to-talk via `AVAudioEngine` + pluggable transcription-provider layer. System-wide keyboard shortcut via listen-only CGEvent tap.
 - **Element Pointing**: the brain embeds `[POINT:x,y:label:screenN]` tags in responses. The overlay parses these, maps coordinates to the correct monitor, and animates the blue cursor along a bezier arc to the target.
-- **Teach Intent**: the brain embeds a trailing `[TEACH:topic name]` tag when the user asks to learn a topic over time; `CompanionManager.parseTeachIntent` strips it and triggers workspace creation + the first lesson turn.
+- **Teach Intent**: every chat turn carries a fresh topic roster (name/slug/lesson count) read from disk; the chat agent routes learning intents by emitting a trailing `[TEACH:topic-slug:instructions]` tag. The sidecar strips the tag, speaks the remainder, and dispatches the instructions asynchronously to the topic's persistent teach session (creating the workspace first when the agent confirmed a new topic by voice). Failures surface as a spoken `teachError` event.
 - **Concurrency**: `@MainActor` isolation, async/await throughout
 - **Analytics**: PostHog via `ClickyAnalytics.swift`
 
@@ -31,13 +31,13 @@ The app spawns `node index.mjs` from `~/Library/Application Support/OpenClicky/s
 
 | Request | Purpose |
 |---------|---------|
-| `chat` | one voice turn: text + screenshot file paths + workspaceId + backend (+ `teachIntent` to invoke `/teach` / `$teach`) |
+| `chat` | one voice turn: text + screenshot file paths + backend. Runs on the ephemeral chat plane; an explicit non-general `workspaceId` (+ `teachIntent`) is a legacy path kept for the drive harness |
 | `oneShot` | stateless turn with a custom system prompt (onboarding demo) |
 | `createWorkspace` / `listWorkspaces` | learning-topic folder management |
 | `authStatus` | login detection for both backends + teach-skill install state |
 | `cancel` / `shutdown` | interrupt an in-flight turn / graceful exit |
 
-Events: `ready`, `status` (per-turn progress), `result`, `error` (codes: `auth_required`, `skill_install_failed`, `workspace_missing`, `cancelled`, `node_backend_crash`, `internal`), `lessonCreated`, `log`.
+Events: `ready` (carries `lessonsRoot` + `dashboardPath`), `status` (per-turn progress), `result`, `error` (codes: `auth_required`, `skill_install_failed`, `workspace_missing`, `cancelled`, `node_backend_crash`, `internal`), `lessonCreated`, `teachError` (background lesson dispatch failed — spoken by the app), `log`.
 
 Auth hygiene: the sidecar strips `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/`CODEX_API_KEY` from its environment so both SDKs fall back to subscription logins. The sanctioned Anthropic API-key path is opt-in via the `clickyAnthropicAPIKey` UserDefaults key (forwarded as `CLICKY_ANTHROPIC_API_KEY`).
 
@@ -64,13 +64,13 @@ The sidecar is fully testable from the terminal without building the app: see `l
 | File | Lines | Purpose |
 |------|-------|---------|
 | `leanring_buddyApp.swift` | ~97 | Menu bar app entry point. Uses `@NSApplicationDelegateAdaptor` with `CompanionAppDelegate` which creates `MenuBarPanelManager`, starts `CompanionManager`, and starts/stops the brain sidecar with the app lifecycle. No main window — the app lives entirely in the status bar. |
-| `CompanionManager.swift` | ~1141 | Central state machine. Owns dictation, shortcut monitoring, screen capture, the brain provider, TTS, and overlay management. Tracks voice state (idle/listening/processing/responding), backend/model/topic selection, and cursor visibility. Coordinates push-to-talk → screenshot → brain → TTS → pointing, parses `[POINT:...]` and `[TEACH:...]` tags, runs the teach-topic flow, and speaks a one-time reassurance on long turns. |
-| `SidecarProcessManager.swift` | ~924 | Brain sidecar supervisor. Discovers Node 18+ (Homebrew/nvm/volta/system + login-shell fallback), installs the bundled sidecar into Application Support (hash-checked `npm ci`), spawns it, speaks NDJSON via continuation-per-request routing, and auto-restarts on crash with backoff. |
-| `CompanionBrainProvider.swift` | ~139 | Brain abstraction used by `CompanionManager`. `SidecarBrainProvider` writes screenshots to disk, sends chat/one-shot requests, maps sidecar status events to `BrainStatus`, cancels on task cancellation, and enforces 3-minute inactivity / 10-minute total watchdogs. |
+| `CompanionManager.swift` | ~827 | Central state machine. Owns dictation, shortcut monitoring, screen capture, the brain provider, TTS, and overlay management. Tracks voice state (idle/listening/processing/responding), backend/model selection, and cursor visibility. Coordinates push-to-talk → screenshot → brain → TTS → pointing, parses `[POINT:...]` tags (teach routing lives in the sidecar now), opens the lessons dashboard, speaks `teachError` failures, and speaks a one-time reassurance on long turns. |
+| `SidecarProcessManager.swift` | ~1063 | Brain sidecar supervisor. Discovers Node 18+ (Homebrew/nvm/volta/system + login-shell fallback), installs the bundled sidecar into Application Support (hash-checked `npm ci`), spawns it, speaks NDJSON via continuation-per-request routing, publishes the lessons-dashboard path from the ready event, surfaces `teachError` via callback, and auto-restarts on crash with backoff. |
+| `CompanionBrainProvider.swift` | ~136 | Brain abstraction used by `CompanionManager`. `SidecarBrainProvider` writes screenshots to disk, sends chat/one-shot requests (no workspace routing — the sidecar owns it), maps sidecar status events to `BrainStatus`, cancels on task cancellation, and enforces 3-minute inactivity / 10-minute total watchdogs. |
 | `AppleTTSClient.swift` | ~115 | `CompanionTTSClient` protocol + local `AVSpeechSynthesizer` implementation (returns when speech starts, prefers premium/enhanced en-US voices). `ElevenLabsTTSClient` conforms for the legacy path. |
 | `ScreenshotFileStore.swift` | ~59 | Per-turn screenshot files under Application Support for sidecar consumption; per-turn cleanup and stale-directory sweep at launch. |
 | `MenuBarPanelManager.swift` | ~243 | NSStatusItem + custom NSPanel lifecycle. Creates the menu bar icon, manages the floating companion panel (show/hide/position), installs click-outside-to-dismiss monitor. |
-| `CompanionPanelView.swift` | ~1036 | SwiftUI panel content for the menu bar dropdown. Shows companion status, push-to-talk instructions, brain backend picker (Claude/Codex), per-backend sign-in status, sidecar health, model picker (Claude only), topic picker with "Next lesson", permissions UI, DM feedback button, and quit button. Dark aesthetic using `DS` design system. |
+| `CompanionPanelView.swift` | ~1078 | SwiftUI panel content for the menu bar dropdown. Shows companion status, push-to-talk instructions, brain backend picker (Claude/Codex), per-backend sign-in status, sidecar health, model/thinking pickers, a "Lessons" button that opens the static dashboard (topics are managed entirely by voice), permissions UI, DM feedback button, and quit button. Dark aesthetic using `DS` design system. |
 | `OverlayWindow.swift` | ~881 | Full-screen transparent overlay hosting the blue cursor, response text, waveform, and spinner. Handles cursor animation, element pointing with bezier arcs, multi-monitor coordinate mapping, and fade-out transitions. |
 | `CompanionResponseOverlay.swift` | ~217 | SwiftUI view for the response text bubble and waveform displayed next to the cursor in the overlay. |
 | `CompanionScreenCaptureUtility.swift` | ~132 | Multi-monitor screenshot capture using ScreenCaptureKit. Returns labeled image data for each connected display. |
@@ -89,15 +89,18 @@ The sidecar is fully testable from the terminal without building the app: see `l
 | `WindowPositionManager.swift` | ~262 | Window placement logic, Screen Recording permission flow, and accessibility permission helpers. |
 | `AppBundleConfiguration.swift` | ~28 | Runtime configuration reader for keys stored in the app bundle Info.plist. |
 | `worker/src/index.ts` | ~142 | Cloudflare Worker proxy (optional legacy). Three routes: `/chat` (Claude), `/tts` (ElevenLabs), `/transcribe-token` (AssemblyAI temp token). |
-| `sidecar/index.mjs` | ~194 | Sidecar entry point: stdin NDJSON dispatch loop, teach-template bootstrap, shutdown on stdin EOF. |
+| `sidecar/index.mjs` | ~329 | Sidecar entry point: stdin NDJSON dispatch loop, chat-plane routing (roster injection, TEACH tag strip + async dispatch, idle reset), startup chat/dashboard/watcher bootstrap, teach-template bootstrap, shutdown on stdin EOF. |
+| `sidecar/src/teachTag.mjs` | ~33 | Parser for the extended `[TEACH:slug:instructions]` tag: strips all teach tags from spoken text, dispatches at most the first well-formed one, defaults missing instructions. |
+| `sidecar/src/topicRoster.mjs` | ~31 | Builds the per-turn `[topic roster]` block (name/slug/lesson count per topic, general and dot-dirs excluded) appended to every chat-plane turn. |
+| `sidecar/src/lessonsDashboard.mjs` | ~86 | Static `index.html` generator at the lessons root: every topic's lessons as plain links, latest highlighted, no server or JS. Regenerated at startup, on workspace creation, and on every `lessonCreated`. |
 | `sidecar/src/claudeBackend.mjs` | ~417 | Claude Agent SDK backend. Persistent streaming-input `query()` session per workspace, base64 image blocks, session resume, `/teach` invocation with SKILL.md fallback, interrupt-on-cancel. |
 | `sidecar/src/codexBackend.mjs` | ~278 | Codex SDK backend. Persistent thread per workspace, `local_image` inputs, thread resume, `$teach` invocation, AbortSignal cancellation. |
-| `sidecar/src/workspaces.mjs` | ~155 | Learning-workspace management: `~/Documents/OpenClicky Lessons/` folders, slugs, `.clicky.json` session bookkeeping, AGENTS.md companion rules for Codex. |
+| `sidecar/src/workspaces.mjs` | ~209 | Learning-workspace management: `~/Documents/OpenClicky Lessons/` folders, slugs, `.clicky.json` session bookkeeping, AGENTS.md companion rules for Codex, plus the hidden `.chat` ephemeral workspace (created at startup, session ids cleared on every launch). |
 | `sidecar/src/teachSkill.mjs` | ~136 | Installs the unmodified teach skill once via `npx skills` into a template, then file-copies it into each workspace (both `.agents/` and `.claude/` layouts, matching the vanilla installer). |
-| `sidecar/src/companionRules.mjs` | ~54 | Single source of truth for the spoken-companion persona + `[POINT:...]`/`[TEACH:...]` tag protocols. Appended to Claude's system-prompt preset; written as workspace AGENTS.md for Codex. |
-| `sidecar/src/lessonWatcher.mjs` | ~73 | Chokidar watcher on workspace roots; emits `lessonCreated` with `openedByAgent` computed from the turn's shell commands. |
+| `sidecar/src/companionRules.mjs` | ~91 | Single source of truth for the spoken-companion persona + `[POINT:...]`/`[TEACH:slug:instructions]` tag protocols, roster grounding, and the ask-before-creating-a-topic rule. Appended to Claude's system-prompt preset; written as AGENTS.md for Codex (full chat notes in `.chat`, slim notes in topic workspaces). |
+| `sidecar/src/lessonWatcher.mjs` | ~79 | Chokidar watcher on workspace roots; regenerates the lessons dashboard and emits `lessonCreated` with `openedByAgent` computed from the turn's shell commands. |
 | `sidecar/src/auth.mjs` / `env.mjs` / `protocol.mjs` | ~150 | Login detection (Keychain/credentials files), subscription-auth env hygiene, NDJSON helpers. |
-| `sidecar/test/drive.mjs` | ~315 | Terminal test harness speaking the real protocol: chat/oneshot/auth/workspaces/teach/resume drives against live subscriptions. |
+| `sidecar/test/drive.mjs` | ~446 | Terminal test harness speaking the real protocol: chat/oneshot/auth/workspaces/teach/resume/split drives against live subscriptions, fresh temp dirs per run. Unit tests live in `test/unit/` (`npm test`). |
 
 ## Build & Run
 
