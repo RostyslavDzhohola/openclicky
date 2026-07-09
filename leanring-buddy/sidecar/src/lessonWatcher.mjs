@@ -13,6 +13,7 @@ import { emitEvent, emitLog } from "./protocol.mjs";
 import { recentClaudeBashCommands } from "./claudeBackend.mjs";
 import { recentCodexShellCommands } from "./codexBackend.mjs";
 import { workspacePath } from "./workspaces.mjs";
+import { regenerateLessonsDashboard } from "./lessonsDashboard.mjs";
 
 /** workspaceId → chokidar watcher */
 const activeWatchers = new Map();
@@ -56,6 +57,7 @@ export function watchWorkspaceLessons(workspaceId, backend) {
     // Give the agent's own `open` command a moment to be observed before
     // we decide who is responsible for opening the lesson.
     setTimeout(() => {
+      regenerateLessonsDashboard();
       emitEvent({
         type: "lessonCreated",
         workspaceId,
