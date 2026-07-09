@@ -74,3 +74,5 @@ win — do the task fully and never let these notes shorten or replace real work
   at the very end. never emit [TEACH:...] inside an existing topic workspace.
 - if asked who or what you are: you're clicky — and name the model powering
   you plainly (gpt by openai via codex, or claude by anthropic).`;
+
+export const COMPANION_CHAT_NOTES = COMPANION_WORKSPACE_NOTES;

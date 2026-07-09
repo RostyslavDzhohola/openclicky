@@ -23,10 +23,11 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { COMPANION_WORKSPACE_NOTES } from "./companionRules.mjs";
+import { COMPANION_CHAT_NOTES, COMPANION_WORKSPACE_NOTES } from "./companionRules.mjs";
 import { emitLog } from "./protocol.mjs";
 
 export const GENERAL_WORKSPACE_ID = "general";
+export const CHAT_WORKSPACE_ID = ".chat";
 
 /** Root folder for all workspaces. Overridable for terminal test runs. */
 export function lessonsRootDirectory() {
@@ -166,4 +167,43 @@ export function listWorkspaces() {
 
 export function workspaceExists(workspaceId) {
   return existsSync(workspacePath(workspaceId));
+}
+
+/**
+ * The ephemeral chat plane lives in a hidden dot-folder under the lessons
+ * root: existing session/metadata machinery works on it unchanged, while the
+ * dot prefix keeps it out of listWorkspaces(), the roster, and the dashboard.
+ * Created directly (not via createWorkspace) because slugifyTopicName would
+ * strip the dot.
+ */
+export function ensureChatWorkspaceExists() {
+  const chatDirectoryPath = workspacePath(CHAT_WORKSPACE_ID);
+  const chatWorkspaceAlreadyExisted = existsSync(chatDirectoryPath);
+  mkdirSync(chatDirectoryPath, { recursive: true });
+
+  const agentsFilePath = join(chatDirectoryPath, "AGENTS.md");
+  const expectedAgentsFileContent = COMPANION_CHAT_NOTES + "\n";
+  const currentAgentsFileContent = existsSync(agentsFilePath)
+    ? readFileSync(agentsFilePath, "utf8")
+    : null;
+  if (currentAgentsFileContent !== expectedAgentsFileContent) {
+    writeFileSync(agentsFilePath, expectedAgentsFileContent);
+  }
+
+  if (!chatWorkspaceAlreadyExisted) {
+    updateWorkspaceMetadata(CHAT_WORKSPACE_ID, {
+      name: "ephemeral chat",
+      slug: CHAT_WORKSPACE_ID,
+      createdAt: new Date().toISOString(),
+    });
+  }
+}
+
+/** Chat context never survives an app restart (design decision). */
+export function clearChatSessionIds() {
+  if (!workspaceExists(CHAT_WORKSPACE_ID)) return;
+  updateWorkspaceMetadata(CHAT_WORKSPACE_ID, {
+    claudeSessionId: null,
+    codexThreadId: null,
+  });
 }
