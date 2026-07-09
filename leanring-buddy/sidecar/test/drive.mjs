@@ -51,6 +51,7 @@ if (!useRealDirectories) {
   mkdirSync(appSupport, { recursive: true });
   driveEnvironment.CLICKY_LESSONS_ROOT = lessonsRoot;
   driveEnvironment.CLICKY_APP_SUPPORT = appSupport;
+  driveEnvironment.CLICKY_CHAT_IDLE_MS = process.env.CLICKY_CHAT_IDLE_MS ?? "3000";
   console.log(`[drive] lessons root: ${lessonsRoot}`);
 }
 
@@ -327,6 +328,86 @@ async function runResumeDrive() {
   await secondSidecar.stop();
 }
 
+async function runSplitDrive() {
+  const sidecar = await startSidecar();
+
+  // 1. Chat-plane turn instructed to emit the extended tag verbatim, so the
+  //    routing is tested without depending on the model's own intent detection.
+  const chatRequestId = newRequestId();
+  sidecar.send({
+    id: chatRequestId,
+    type: "chat",
+    backend,
+    model: chatModelForBackend(backend),
+    effort: "low",
+    text:
+      'this is a routing test. reply with one short sentence and end your reply with exactly this tag, verbatim: [TEACH:drive-split-topic:create a one-page hello lesson that says hello world]',
+    images: [],
+  });
+  const chatCompletion = await sidecar.waitForCompletion(chatRequestId, 300_000);
+  assertCondition(chatCompletion.type === "result", `chat turn failed: ${chatCompletion.message}`);
+  assertCondition(
+    !chatCompletion.text.includes("[TEACH"),
+    `tag leaked into spoken text: ${chatCompletion.text}`
+  );
+
+  // 2. The dispatch must create the topic workspace and land a lesson.
+  const lessonEvent = await sidecar.waitFor(
+    (event) => event.type === "lessonCreated" && event.workspaceId === "drive-split-topic",
+    600_000
+  );
+  console.log(`[drive] lesson created: ${lessonEvent.path}`);
+
+  // 3. Dashboard exists and links the new lesson.
+  const { readFileSync } = await import("node:fs");
+  const dashboardHtml = readFileSync(
+    join(driveEnvironment.CLICKY_LESSONS_ROOT ?? "", "index.html"),
+    "utf8"
+  );
+  assertCondition(
+    dashboardHtml.includes("drive-split-topic"),
+    "dashboard does not list the dispatched topic"
+  );
+
+  // 4. Idle reset: with CLICKY_CHAT_IDLE_MS=3000 in the drive env, teach the
+  //    chat a codeword, wait past the window, and confirm it is forgotten.
+  const codeword = `split-${Date.now()}`;
+  const memorizeRequestId = newRequestId();
+  sidecar.send({
+    id: memorizeRequestId,
+    type: "chat",
+    backend,
+    model: chatModelForBackend(backend),
+    effort: "low",
+    text: `remember this codeword and repeat it back: ${codeword}`,
+    images: [],
+  });
+  const memorizeCompletion = await sidecar.waitForCompletion(memorizeRequestId, 300_000);
+  assertCondition(memorizeCompletion.type === "result", "memorize turn failed");
+
+  await new Promise((resolvePause) => setTimeout(resolvePause, 6_000));
+
+  const recallRequestId = newRequestId();
+  sidecar.send({
+    id: recallRequestId,
+    type: "chat",
+    backend,
+    model: chatModelForBackend(backend),
+    effort: "low",
+    text: "what codeword did i give you earlier? if you do not know, say exactly: no codeword",
+    images: [],
+  });
+  const recallCompletion = await sidecar.waitForCompletion(recallRequestId, 300_000);
+  assertCondition(recallCompletion.type === "result", "recall turn failed");
+  assertCondition(
+    !recallCompletion.text.includes(codeword),
+    `chat session survived the idle window — codeword recalled: ${recallCompletion.text}`
+  );
+
+  console.log("\n[PASS] chat plane routes, dispatches, and forgets on idle");
+  await sidecar.stop();
+}
+
 const driveSubcommands = {
   chat: runChatDrive,
   oneshot: runOneShotDrive,
@@ -334,6 +415,7 @@ const driveSubcommands = {
   workspaces: runWorkspacesDrive,
   teach: runTeachDrive,
   resume: runResumeDrive,
+  split: runSplitDrive,
 };
 
 const selectedDrive = driveSubcommands[subcommand];

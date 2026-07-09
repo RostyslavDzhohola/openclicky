@@ -17,6 +17,7 @@
     "drive:compare": "node test/compare.mjs",
     "drive:auth": "node test/drive.mjs auth",
     "drive:resume": "node test/drive.mjs resume",
+    "drive:split": "node test/drive.mjs split",
     "drive:workspaces": "node test/drive.mjs workspaces",
     "clean": "rm -rf node_modules"
   },
