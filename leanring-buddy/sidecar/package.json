@@ -10,6 +10,7 @@
   },
   "scripts": {
     "start": "node index.mjs",
+    "test": "node --test test/unit/*.test.mjs",
     "drive": "node test/drive.mjs chat",
     "drive:oneshot": "node test/drive.mjs oneshot",
     "drive:teach": "node test/drive.mjs teach",
