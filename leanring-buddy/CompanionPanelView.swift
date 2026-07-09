@@ -82,6 +82,9 @@ struct CompanionPanelView: View {
             // Re-read topics and lessons from disk so the lessons picker reflects
             // any lessons created while the panel was closed.
             companionManager.refreshLessonTopicListings()
+            // Re-read connected microphones so the mic picker reflects devices
+            // plugged in or removed while the panel was closed.
+            companionManager.refreshAvailableMicrophones()
         }
     }
 
@@ -99,6 +102,7 @@ struct CompanionPanelView: View {
             backendPickerRow
             modelPickerRow
             thinkingPickerRow
+            microphonePickerRow
             lessonsSection
         }
     }
@@ -668,6 +672,91 @@ struct CompanionPanelView: View {
                 )
         }
         .buttonStyle(.plain)
+        .pointerCursor()
+    }
+
+    // MARK: - Microphone Picker
+
+    /// The "Microphone" row. Lets the user pin a specific input device so macOS
+    /// can't silently route push-to-talk capture through AirPods (which forces
+    /// the awful-sounding Bluetooth HFP codec). "System default" keeps the OS
+    /// behaviour. Styled to match the Model / Thinking rows: a 13pt label on the
+    /// left and a borderless menu control on the right.
+    private var microphonePickerRow: some View {
+        HStack {
+            Text("Microphone")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(DS.Colors.textSecondary)
+
+            Spacer()
+
+            microphoneMenu
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// The display name shown on the menu's label: the pinned microphone's name
+    /// when one is selected and still connected, otherwise "System default".
+    private var selectedMicrophoneDisplayName: String {
+        guard let selectedMicrophoneUID = companionManager.selectedMicrophoneUID else {
+            return "System default"
+        }
+        let matchingMicrophone = companionManager.availableMicrophones
+            .first { $0.id == selectedMicrophoneUID }
+        return matchingMicrophone?.displayName ?? "System default"
+    }
+
+    /// Borderless menu mirroring the lessons menu's styling. Lists "System
+    /// default" first (checkmark when nothing is pinned) then every connected
+    /// microphone (checkmark on the pinned one).
+    private var microphoneMenu: some View {
+        Menu {
+            Button {
+                companionManager.setSelectedMicrophoneUID(nil)
+            } label: {
+                if companionManager.selectedMicrophoneUID == nil {
+                    Label("System default", systemImage: "checkmark")
+                } else {
+                    Text("System default")
+                }
+            }
+
+            ForEach(companionManager.availableMicrophones) { microphone in
+                Button {
+                    companionManager.setSelectedMicrophoneUID(microphone.id)
+                } label: {
+                    if companionManager.selectedMicrophoneUID == microphone.id {
+                        Label(microphone.displayName, systemImage: "checkmark")
+                    } else {
+                        Text(microphone.displayName)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text(selectedMicrophoneDisplayName)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(DS.Colors.textPrimary)
+                    .lineLimit(1)
+
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(DS.Colors.textTertiary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.white.opacity(0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+            )
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
         .pointerCursor()
     }
 

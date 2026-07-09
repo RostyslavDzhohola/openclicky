@@ -10,6 +10,7 @@
 import AppKit
 import AVFoundation
 import Combine
+import CoreAudio
 import Foundation
 import Speech
 
@@ -204,6 +205,15 @@ enum BuddyDictationPermissionProblem {
     case speechRecognitionDenied
 }
 
+/// A microphone the user can pin for push-to-talk capture. The `id` is the
+/// CoreAudio device UID (identical to `AVCaptureDevice.uniqueID`), which is what
+/// we persist and later translate back into a live `AudioDeviceID` when a
+/// recording session starts.
+struct CaptureMicrophone: Identifiable, Equatable {
+    let id: String       // AVCaptureDevice.uniqueID == CoreAudio device UID
+    let displayName: String
+}
+
 private enum BuddyDictationStartSource {
     case microphoneButton
     case keyboardShortcut
@@ -217,6 +227,11 @@ private struct BuddyDictationDraftCallbacks {
 @MainActor
 final class BuddyDictationManager: NSObject, ObservableObject {
     private static let defaultFinalTranscriptFallbackDelaySeconds: TimeInterval = 2.4
+    /// UserDefaults key holding the CoreAudio UID of the microphone the user has
+    /// pinned for push-to-talk. Absent / `nil` means "use the system default
+    /// input" (which is what macOS auto-routes to AirPods, the case this picker
+    /// exists to override).
+    private static let preferredMicrophoneUIDDefaultsKey = "clickyPreferredMicrophoneUID"
     private static let recordedAudioPowerHistoryLength = 44
     private static let recordedAudioPowerHistoryBaselineLevel: CGFloat = 0.02
     private static let recordedAudioPowerHistorySampleIntervalSeconds: TimeInterval = 0.07
@@ -289,6 +304,107 @@ final class BuddyDictationManager: NSObject, ObservableObject {
 
     func updateContextualKeyterms(_ contextualKeyterms: [String]) {
         self.contextualKeyterms = contextualKeyterms
+    }
+
+    // MARK: - Microphone Selection
+
+    /// Enumerates the microphones the user can pin for push-to-talk capture.
+    /// Uses the macOS 14 device types (`.microphone` for built-in / USB inputs,
+    /// `.external` for other external audio devices). The returned `id` is the
+    /// device UID, which round-trips through UserDefaults and CoreAudio's
+    /// UID→AudioDeviceID translation when a recording session starts.
+    static func availableCaptureMicrophones() -> [CaptureMicrophone] {
+        let discoverySession = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.microphone, .external],
+            mediaType: .audio,
+            position: .unspecified
+        )
+
+        return discoverySession.devices.map { captureDevice in
+            CaptureMicrophone(
+                id: captureDevice.uniqueID,
+                displayName: captureDevice.localizedName
+            )
+        }
+    }
+
+    /// The microphone UID the user has pinned, or `nil` when they want the
+    /// system default input.
+    func preferredMicrophoneUID() -> String? {
+        UserDefaults.standard.string(forKey: Self.preferredMicrophoneUIDDefaultsKey)
+    }
+
+    /// Pins a specific microphone by UID (or clears the pin with `nil` to fall
+    /// back to the system default input). The change takes effect on the next
+    /// push-to-talk session — no restart needed — because the override is
+    /// re-applied at every session start (see `startRecognitionSession`).
+    func setPreferredMicrophoneUID(_ preferredMicrophoneUID: String?) {
+        if let preferredMicrophoneUID, !preferredMicrophoneUID.isEmpty {
+            UserDefaults.standard.set(preferredMicrophoneUID, forKey: Self.preferredMicrophoneUIDDefaultsKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.preferredMicrophoneUIDDefaultsKey)
+        }
+    }
+
+    /// Translates a CoreAudio device UID into a live `AudioDeviceID`, or returns
+    /// `nil` when no connected device matches (e.g. the pinned microphone was
+    /// unplugged). Callers treat `nil` as "fall back to the system default".
+    private func audioDeviceID(forUID microphoneUID: String) -> AudioDeviceID? {
+        var translationAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var resolvedDeviceID = AudioDeviceID(kAudioObjectUnknown)
+        var resolvedDeviceIDSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var microphoneUIDString = microphoneUID as CFString
+        let translationStatus = withUnsafeMutablePointer(to: &microphoneUIDString) { microphoneUIDPointer in
+            AudioObjectGetPropertyData(
+                AudioObjectID(kAudioObjectSystemObject),
+                &translationAddress,
+                UInt32(MemoryLayout<CFString>.size),
+                microphoneUIDPointer,
+                &resolvedDeviceIDSize,
+                &resolvedDeviceID
+            )
+        }
+        guard translationStatus == noErr, resolvedDeviceID != kAudioObjectUnknown else { return nil }
+        return resolvedDeviceID
+    }
+
+    /// Applies the user's pinned-microphone preference to the shared audio
+    /// engine's input node BEFORE the tap format is read, so the tap picks up the
+    /// chosen device's native format. Re-applied at every session start so a
+    /// changed selection (or a device that came back) takes effect on the next
+    /// push-to-talk without an app restart. Silently falls back to the system
+    /// default input (with a printed warning) when no preference is set or the
+    /// pinned device can no longer be resolved.
+    private func applyPreferredMicrophoneOverrideToInputNode() {
+        guard let preferredMicrophoneUID = preferredMicrophoneUID(), !preferredMicrophoneUID.isEmpty else {
+            return
+        }
+
+        guard var resolvedDeviceID = audioDeviceID(forUID: preferredMicrophoneUID) else {
+            print("⚠️ BuddyDictationManager: preferred microphone \(preferredMicrophoneUID) is unavailable; using system default input")
+            return
+        }
+
+        guard let inputAudioUnit = audioEngine.inputNode.audioUnit else {
+            print("⚠️ BuddyDictationManager: input node has no audio unit; using system default input")
+            return
+        }
+
+        let setDeviceStatus = AudioUnitSetProperty(
+            inputAudioUnit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &resolvedDeviceID,
+            UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+        if setDeviceStatus != noErr {
+            print("⚠️ BuddyDictationManager: failed to pin microphone \(preferredMicrophoneUID) (status \(setDeviceStatus)); using system default input")
+        }
     }
 
     func startPersistentDictationFromMicrophoneButton(
@@ -547,6 +663,11 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         print("🎙️ BuddyDictationManager: provider ready, starting audio engine")
 
         let inputNode = audioEngine.inputNode
+        // Pin the user's chosen microphone (if any) BEFORE reading the tap
+        // format below — the input node's format changes with the device, so the
+        // override must land first or the tap would capture at the previous
+        // device's format.
+        applyPreferredMicrophoneOverrideToInputNode()
         let inputFormat = inputNode.outputFormat(forBus: 0)
 
         inputNode.removeTap(onBus: 0)

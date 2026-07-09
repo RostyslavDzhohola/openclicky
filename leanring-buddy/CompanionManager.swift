@@ -291,6 +291,32 @@ final class CompanionManager: ObservableObject {
         lessonTopicListings = topicListings
     }
 
+    /// The microphones the panel's mic picker can offer, refreshed from the
+    /// hardware when the panel opens. The dictation manager owns enumeration;
+    /// this just republishes for SwiftUI. `nil` selection = system default input.
+    @Published private(set) var availableMicrophones: [CaptureMicrophone] = []
+
+    /// Re-reads the connected microphones so the panel's picker reflects devices
+    /// plugged in or removed while it was closed.
+    func refreshAvailableMicrophones() {
+        availableMicrophones = BuddyDictationManager.availableCaptureMicrophones()
+    }
+
+    /// The UID of the microphone the user has pinned for push-to-talk, or `nil`
+    /// for the system default input. Reads through to the dictation manager,
+    /// which owns persistence; setting writes UserDefaults and republishes so the
+    /// picker's checkmark updates immediately.
+    var selectedMicrophoneUID: String? {
+        buddyDictationManager.preferredMicrophoneUID()
+    }
+
+    /// Pins a specific microphone by UID (or clears the pin with `nil`). The
+    /// change takes effect on the next push-to-talk turn; no restart needed.
+    func setSelectedMicrophoneUID(_ selectedMicrophoneUID: String?) {
+        buddyDictationManager.setPreferredMicrophoneUID(selectedMicrophoneUID)
+        objectWillChange.send()
+    }
+
     /// Reads a topic's human-readable name from its `.clicky.json` metadata file,
     /// falling back to the folder name when the file is missing or unreadable.
     private static func topicDisplayName(forFolderURL topicDirectoryURL: URL, folderName: String) -> String {
