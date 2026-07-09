@@ -19,8 +19,6 @@ protocol CompanionBrainProvider {
         backend: String,
         model: String,
         effort: String,
-        workspaceId: String,
-        teachIntent: Bool,
         onStatus: @MainActor @Sendable @escaping (BrainStatus) -> Void
     ) async throws -> String
 
@@ -60,8 +58,6 @@ final class SidecarBrainProvider: CompanionBrainProvider {
         backend: String,
         model: String,
         effort: String,
-        workspaceId: String,
-        teachIntent: Bool,
         onStatus: @MainActor @Sendable @escaping (BrainStatus) -> Void
     ) async throws -> String {
         let writtenCaptures = try ScreenshotFileStore.writeCaptures(images)
@@ -77,12 +73,10 @@ final class SidecarBrainProvider: CompanionBrainProvider {
                     try await self.sidecarManager.sendChat(
                         requestId: requestId,
                         backend: backend,
-                        workspaceId: workspaceId,
                         model: model,
                         effort: effort,
                         text: transcript,
                         images: writtenCaptures.images,
-                        teachIntent: teachIntent,
                         onStatus: { event in
                             lastEventAt = Date()
                             if event.phase == "tool" {
