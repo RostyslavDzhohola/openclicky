@@ -35,6 +35,7 @@ final class AppleSpeechTranscriptionProvider: BuddyTranscriptionProvider {
 
         return try AppleSpeechTranscriptionSession(
             speechRecognizer: speechRecognizer,
+            keyterms: keyterms,
             onTranscriptUpdate: onTranscriptUpdate,
             onFinalTranscriptReady: onFinalTranscriptReady,
             onError: onError
@@ -72,6 +73,7 @@ private final class AppleSpeechTranscriptionSession: NSObject, BuddyStreamingTra
 
     init(
         speechRecognizer: SFSpeechRecognizer,
+        keyterms: [String],
         onTranscriptUpdate: @escaping (String) -> Void,
         onFinalTranscriptReady: @escaping (String) -> Void,
         onError: @escaping (Error) -> Void
@@ -86,6 +88,11 @@ private final class AppleSpeechTranscriptionSession: NSObject, BuddyStreamingTra
         recognitionRequest.shouldReportPartialResults = true
         recognitionRequest.taskHint = .dictation
         recognitionRequest.addsPunctuation = true
+        // Bias recognition toward the app's domain vocabulary (topic names,
+        // tech terms like "JavaScript") — without this the on-device model
+        // regularly mishears proper nouns. AssemblyAI already consumes these
+        // same keyterms; Apple Speech was silently dropping them.
+        recognitionRequest.contextualStrings = keyterms
 
         if speechRecognizer.supportsOnDeviceRecognition {
             recognitionRequest.requiresOnDeviceRecognition = true

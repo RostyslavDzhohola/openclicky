@@ -661,7 +661,14 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             "Xcode",
             "Vercel",
             "Next.js",
-            "localhost"
+            "localhost",
+            "JavaScript",
+            "TypeScript",
+            "CSS",
+            "flexbox",
+            "teach me",
+            "lesson",
+            "Clicky"
         ]
 
         let combinedKeyterms = baseKeyterms + contextualKeyterms
