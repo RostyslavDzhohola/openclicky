@@ -58,8 +58,12 @@ function armChatIdleReset() {
   clearTimeout(chatIdleResetTimer);
   chatIdleResetTimer = setTimeout(async () => {
     emitLog("info", "chat idle window elapsed — resetting ephemeral chat sessions");
-    await resetClaudeSession(CHAT_WORKSPACE_ID);
-    await resetCodexSession(CHAT_WORKSPACE_ID);
+    try {
+      await resetClaudeSession(CHAT_WORKSPACE_ID);
+      await resetCodexSession(CHAT_WORKSPACE_ID);
+    } catch (resetError) {
+      emitLog("warn", `chat idle reset failed: ${String(resetError?.message ?? resetError)}`);
+    }
   }, CHAT_IDLE_RESET_MS);
   // Never keep the process alive just for the reset timer.
   chatIdleResetTimer.unref?.();
@@ -140,6 +144,11 @@ async function handleChatRequest(request) {
     teachIntent: !isChatPlaneTurn && request.teachIntent === true,
     onStatus,
   };
+
+  // A turn in flight is activity; the inactivity window must never expire mid-turn.
+  if (isChatPlaneTurn) {
+    clearTimeout(chatIdleResetTimer);
+  }
 
   const turnResult =
     request.backend === "codex"
