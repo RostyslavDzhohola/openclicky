@@ -16,7 +16,7 @@
 // Pass --real to use the real ~/Documents/Clicky Lessons + Application Support.
 
 import { spawn } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -45,10 +45,12 @@ function chatModelForBackend(selectedBackend) {
 
 const driveEnvironment = { ...process.env };
 if (!useRealDirectories) {
-  const lessonsRoot = join(tmpdir(), "clicky-drive-lessons");
-  const appSupport = join(tmpdir(), "clicky-drive-support");
-  mkdirSync(lessonsRoot, { recursive: true });
-  mkdirSync(appSupport, { recursive: true });
+  // Fresh directories per drive run: a fixed path leaks workspace state
+  // (lessons, session ids) between runs, and a dispatched teach turn that
+  // finds its lesson already on disk creates nothing — so lessonCreated
+  // never fires and stateful modes like split hang to timeout.
+  const lessonsRoot = mkdtempSync(join(tmpdir(), "clicky-drive-lessons-"));
+  const appSupport = mkdtempSync(join(tmpdir(), "clicky-drive-support-"));
   driveEnvironment.CLICKY_LESSONS_ROOT = lessonsRoot;
   driveEnvironment.CLICKY_APP_SUPPORT = appSupport;
   driveEnvironment.CLICKY_CHAT_IDLE_MS = process.env.CLICKY_CHAT_IDLE_MS ?? "3000";
