@@ -419,6 +419,18 @@ final class CompanionManager: ObservableObject {
             }
         }
 
+        // A dictation session that captured only silence (or failed to start)
+        // would otherwise end in a wordless nothing — speak a hint so the user
+        // knows to check the mic picker instead of blaming the brain.
+        buddyDictationManager.onDictationProducedNoAudibleSpeech = { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                try? await self.textToSpeechClient.speakText(
+                    "i couldn't hear anything — check your microphone selection in the panel"
+                )
+            }
+        }
+
         markOnboardingCompleteIfPermissionsReady()
 
         // If the user has completed setup AND all permissions are still granted,
