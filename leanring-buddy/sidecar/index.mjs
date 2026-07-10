@@ -6,6 +6,7 @@
 // its lifetime can never outlive the app that spawned it.
 
 import { createInterface } from "node:readline";
+import { spawn } from "node:child_process";
 import { sanitizeProcessEnvForSubscriptionAuth } from "./src/env.mjs";
 
 // Must happen before any SDK import spawns a child process.
@@ -29,6 +30,7 @@ const {
   GENERAL_WORKSPACE_ID,
 } = await import("./src/workspaces.mjs");
 const { parseTeachTag } = await import("./src/teachTag.mjs");
+const { parseOpenTag, resolveOpenLessonPath } = await import("./src/openTag.mjs");
 const {
   INTERVIEW_PREAMBLE,
   LESSON_GROUNDING_NOTE,
@@ -58,7 +60,11 @@ const {
 const { ensureTeachSkillInstalled, teachSkillInstallState } = await import(
   "./src/teachSkill.mjs"
 );
-const { watchWorkspaceLessons } = await import("./src/lessonWatcher.mjs");
+const {
+  beginTeachTurnHold,
+  endTeachTurnHold,
+  watchWorkspaceLessons,
+} = await import("./src/lessonWatcher.mjs");
 const { clearPendingDispatch, recordPendingDispatch, takePendingDispatches } = await import(
   "./src/teachDispatchQueue.mjs"
 );
@@ -74,6 +80,51 @@ let interviewExpiryTimer = null;
 // in-flight backend turn; remember them so a cancelled setup never arms
 // interview routing (entries are dropped when their chat request finishes).
 const cancelledChatRequestIds = new Set();
+
+function handleOpenLessonRequest(openRequest) {
+  if (!openRequest) return;
+
+  const resolution = resolveOpenLessonPath({
+    lessonsRootDirectory: lessonsRootDirectory(),
+    topicSlug: openRequest.topicSlug,
+    lessonOrdinal: openRequest.lessonOrdinal,
+  });
+  if (!resolution.lessonPath) {
+    emitLog(
+      "info",
+      `open lesson failed slug=${openRequest.topicSlug} ordinal=${openRequest.lessonOrdinal ?? "latest"} reason=${resolution.failureReason}`
+    );
+    emitEvent({ type: "speak", text: "hmm, i couldn't find that lesson." });
+    return;
+  }
+
+  emitLog(
+    "info",
+    `open lesson slug=${openRequest.topicSlug} ordinal=${openRequest.lessonOrdinal ?? "latest"} file=${resolution.lessonPath}`
+  );
+  const openProcess = spawn("open", [resolution.lessonPath], {
+    detached: true,
+    stdio: "ignore",
+  });
+  openProcess.on("error", (openError) => {
+    emitLog(
+      "info",
+      `open lesson failed slug=${openRequest.topicSlug} file=${resolution.lessonPath} reason=${String(openError?.message ?? openError)}`
+    );
+    emitEvent({ type: "speak", text: "hmm, i couldn't open that lesson." });
+  });
+  openProcess.unref();
+}
+
+function parseChatResponseTags(responseText) {
+  const teachTagResult = parseTeachTag(responseText);
+  const openTagResult = parseOpenTag(teachTagResult.cleanedText);
+  return {
+    cleanedText: openTagResult.cleanedText,
+    teachDispatch: teachTagResult.dispatch,
+    openRequest: openTagResult.openRequest,
+  };
+}
 
 function armChatIdleReset() {
   clearTimeout(chatIdleResetTimer);
@@ -147,6 +198,8 @@ async function dispatchTeachInstructions({ backend, model, topicText, instructio
   });
 
   let workspace;
+  let spokenWrapUpText = "";
+  let teachTurnHoldStarted = false;
   try {
     workspace = await prepareTeachWorkspace({ topicText, backend });
     if (!workspace) return;
@@ -175,10 +228,20 @@ async function dispatchTeachInstructions({ backend, model, topicText, instructio
     );
     emitEvent({ type: "teachBuildStarted", workspaceId: workspace.id, topicName: topicText });
     let turnResult;
-    if (backend === "codex") {
-      turnResult = await runCodexChatTurn(dispatchArguments);
-    } else {
-      turnResult = await runClaudeChatTurn(dispatchArguments);
+    beginTeachTurnHold(workspace.id);
+    teachTurnHoldStarted = true;
+    try {
+      if (backend === "codex") {
+        turnResult = await runCodexChatTurn(dispatchArguments);
+      } else {
+        turnResult = await runClaudeChatTurn(dispatchArguments);
+      }
+    } finally {
+      // The final tool commands, including a non-compliant agent's `open`, are
+      // available only after the teach turn resolves. Flush lesson events now
+      // so the app and its spoken completion announcement stay in lockstep.
+      endTeachTurnHold(workspace.id);
+      teachTurnHoldStarted = false;
     }
     const resultPreview = String(turnResult?.text ?? "").slice(0, 200);
     emitLog("info", `teach dispatch for ${workspace.id} finished: ${resultPreview}`);
@@ -188,12 +251,9 @@ async function dispatchTeachInstructions({ backend, model, topicText, instructio
     // lesson update is announced instead of dying in the logs. Tags are
     // stripped: a dispatched turn has no screenshot, so a [POINT:...] tag
     // would be meaningless, and no tag should ever be read aloud.
-    const spokenWrapUpText = parseTeachTag(String(turnResult?.text ?? ""))
+    spokenWrapUpText = parseTeachTag(String(turnResult?.text ?? ""))
       .cleanedText.replace(/\[POINT:[^\]]*\]/gi, "")
       .trim();
-    if (spokenWrapUpText.length > 0) {
-      emitEvent({ type: "speak", text: spokenWrapUpText });
-    }
   } catch (dispatchError) {
     emitEvent({
       type: "teachError",
@@ -202,8 +262,17 @@ async function dispatchTeachInstructions({ backend, model, topicText, instructio
       message: String(dispatchError?.message ?? dispatchError),
     });
   } finally {
+    if (teachTurnHoldStarted && workspace) {
+      endTeachTurnHold(workspace.id);
+    }
     // Only an abrupt process death should leave work in the durable queue.
     clearPendingDispatch(requestId);
+  }
+
+  // Emit speech after the hold flush: if Clicky needs to open the page, the
+  // user sees that single app-side open immediately before this announcement.
+  if (spokenWrapUpText.length > 0) {
+    emitEvent({ type: "speak", text: spokenWrapUpText });
   }
 }
 
@@ -224,10 +293,18 @@ async function startInterview({ backend, model, effort, topicText, instructions,
 
   // Interview turns are intentionally not durable: after a crash, a missing
   // MISSION.md safely causes the next teach request to begin again.
-  const turnResult =
-    backend === "codex"
-      ? await runCodexChatTurn(interviewTurnArguments)
-      : await runClaudeChatTurn(interviewTurnArguments);
+  beginTeachTurnHold(workspace.id);
+  let turnResult;
+  try {
+    turnResult =
+      backend === "codex"
+        ? await runCodexChatTurn(interviewTurnArguments)
+        : await runClaudeChatTurn(interviewTurnArguments);
+  } finally {
+    // A mission interview should not build a lesson, but this hold preserves
+    // correct notification ordering if a model does so despite the prompt.
+    endTeachTurnHold(workspace.id);
+  }
 
   return {
     workspace,
@@ -301,14 +378,23 @@ async function handleChatRequest(request) {
     watchWorkspaceLessons(activeInterview.workspaceId, activeInterview.backend);
 
     try {
-      const turnResult =
-        activeInterview.backend === "codex"
-          ? await runCodexChatTurn(routedTurnArguments)
-          : await runClaudeChatTurn(routedTurnArguments);
-      const { cleanedText, dispatch } = parseTeachTag(turnResult.text);
-      if (dispatch) {
+      beginTeachTurnHold(activeInterview.workspaceId);
+      let turnResult;
+      try {
+        turnResult =
+          activeInterview.backend === "codex"
+            ? await runCodexChatTurn(routedTurnArguments)
+            : await runClaudeChatTurn(routedTurnArguments);
+      } finally {
+        // The teach skill can build a lesson mid-interview despite being told
+        // not to; defer that lesson notification until its turn is complete.
+        endTeachTurnHold(activeInterview.workspaceId);
+      }
+      const { cleanedText, teachDispatch, openRequest } = parseChatResponseTags(turnResult.text);
+      if (teachDispatch) {
         emitLog("warn", `ignoring leaked teach tag from interview workspace ${activeInterview.workspaceId}`);
       }
+      handleOpenLessonRequest(openRequest);
 
       const interviewConclusion = concludeInterviewIfMissionCaptured();
       if (!interviewConclusion.missionCaptured) {
@@ -377,17 +463,18 @@ async function handleChatRequest(request) {
 
     let responseText = turnResult.text;
     if (isChatPlaneTurn) {
-      const { cleanedText, dispatch } = parseTeachTag(responseText);
+      const { cleanedText, teachDispatch, openRequest } = parseChatResponseTags(responseText);
       responseText = cleanedText;
-      if (dispatch) {
-        const topicWorkspaceDirectory = workspacePath(slugifyTopicName(dispatch.topicText));
+      handleOpenLessonRequest(openRequest);
+      if (teachDispatch) {
+        const topicWorkspaceDirectory = workspacePath(slugifyTopicName(teachDispatch.topicText));
         if (missionFileExists(topicWorkspaceDirectory)) {
           // Mission already captured: a minutes-long lesson build never blocks the chat.
           void dispatchTeachInstructions({
             backend: request.backend,
             model: request.model,
-            topicText: dispatch.topicText,
-            instructions: dispatch.instructions,
+            topicText: teachDispatch.topicText,
+            instructions: teachDispatch.instructions,
           });
         } else {
           // No mission yet: run the teach skill's own mission interview over voice.
@@ -402,8 +489,8 @@ async function handleChatRequest(request) {
               backend: request.backend,
               model: request.model,
               effort: request.effort,
-              topicText: dispatch.topicText,
-              instructions: dispatch.instructions,
+              topicText: teachDispatch.topicText,
+              instructions: teachDispatch.instructions,
               requestId: request.id,
               onStatus,
             });
@@ -422,7 +509,7 @@ async function handleChatRequest(request) {
                   workspaceId: interviewStart.workspace.id,
                   backend: request.backend,
                   model: request.model,
-                  topicText: dispatch.topicText,
+                  topicText: teachDispatch.topicText,
                   lessonCountAtInterviewStart: interviewStart.lessonCountBeforeInterview,
                 });
                 // The model may capture the mission on the first turn if the
@@ -446,13 +533,20 @@ async function handleChatRequest(request) {
             }
             emitEvent({
               type: "teachError",
-              workspaceId: slugifyTopicName(dispatch.topicText),
-              topicName: dispatch.topicText,
+              workspaceId: slugifyTopicName(teachDispatch.topicText),
+              topicName: teachDispatch.topicText,
               message: String(interviewError?.message ?? interviewError),
             });
           }
         }
       }
+
+      // A first mission-interview reply is appended above after the original
+      // chat reply was parsed. Strip any accidental OPEN tag from that newly
+      // added spoken text too, so every chat-plane response stays protocol-clean.
+      const finalOpenTagResult = parseOpenTag(responseText);
+      responseText = finalOpenTagResult.cleanedText;
+      handleOpenLessonRequest(finalOpenTagResult.openRequest);
     }
 
     emitEvent({

@@ -15,6 +15,7 @@ MISSION.md has not been written for this topic yet. before anything else, follow
 
 export const LESSON_GROUNDING_NOTE =
   "\n\nbefore writing the lesson, use web search to ground your understanding of this topic in current, accurate information — verify key facts and examples rather than relying on memory." +
+  "\n\ndo not open the lesson in a browser and do not run `open` on it — the companion app opens finished lessons itself and announces them." +
   "\n\nin any quiz, randomize which option position holds the correct answer, and keep all options the same length and word count so formatting gives no clues.";
 
 export const POST_INTERVIEW_BUILD_INSTRUCTIONS = `the mission interview is complete and MISSION.md is written. the user cannot answer questions from here — do not ask anything; rely on MISSION.md for what they want. build the first lesson now.`;

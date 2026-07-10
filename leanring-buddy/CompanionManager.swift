@@ -942,19 +942,29 @@ final class CompanionManager: ObservableObject {
     /// deliberately does NOT change voiceState — the processing spinner stays.
     /// Mirrors a spoken line as a typed-out bubble beside the blue cursor so
     /// the user can read along with the TTS (BlueCursorView renders it with
-    /// the same typewriter rhythm as the pointing bubble). Cleared after
-    /// roughly the duration of the speech — reading pace ≈ speaking pace,
-    /// ~13 characters per second, plus a short linger — or immediately when
-    /// the user starts a new utterance.
+    /// the same typewriter rhythm as the pointing bubble). Cleared 3 seconds
+    /// after TTS playback actually finishes — or immediately when the user
+    /// starts a new utterance.
     private func displaySpokenTextBubble(_ spokenText: String) {
         let responseBubble = SpokenResponseBubble(id: UUID(), text: spokenText)
         spokenResponseBubble = responseBubble
 
         spokenResponseBubbleClearTask?.cancel()
-        let bubbleVisibleSeconds = max(8.0, min(75.0, Double(spokenText.count) / 13.0 + 4.0))
         spokenResponseBubbleClearTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(bubbleVisibleSeconds * 1_000_000_000))
+            // The bubble is displayed just before speakText() starts the
+            // utterance, so isPlaying is briefly still false here. Give
+            // playback a moment to begin before treating "not playing" as
+            // "finished" — otherwise the bubble would clear mid-speech.
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
             guard let self, !Task.isCancelled else { return }
+
+            while self.textToSpeechClient.isPlaying {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                guard !Task.isCancelled else { return }
+            }
+
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled else { return }
             // Only clear the bubble this task was armed for — a newer line
             // owns its own clear task.
             if self.spokenResponseBubble?.id == responseBubble.id {

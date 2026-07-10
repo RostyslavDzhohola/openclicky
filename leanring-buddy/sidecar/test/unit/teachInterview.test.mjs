@@ -140,6 +140,10 @@ test("interview constants are populated with the required mission guidance", () 
 
   assert.match(INTERVIEW_PREAMBLE, /MISSION\.md/);
   assert.match(POST_INTERVIEW_BUILD_INSTRUCTIONS, /MISSION\.md/);
+  assert.match(
+    LESSON_GROUNDING_NOTE,
+    /do not open the lesson in a browser and do not run `open` on it/i
+  );
   assert.equal(INTERVIEW_TURN_CAP, 8);
 });
 
