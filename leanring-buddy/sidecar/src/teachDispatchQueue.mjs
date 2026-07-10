@@ -5,7 +5,7 @@
 // the next sidecar instance retry that work without making normal chat turns
 // wait for it.
 
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { applicationSupportDirectory } from "./appSupport.mjs";
 import { emitLog } from "./protocol.mjs";
@@ -55,11 +55,22 @@ function readPendingDispatches() {
 
 function writePendingDispatches(pendingDispatches) {
   const queueFilePath = pendingDispatchesFilePath();
+  const temporaryQueueFilePath = `${queueFilePath}.${process.pid}.tmp`;
   try {
     mkdirSync(applicationSupportDirectory(), { recursive: true });
-    writeFileSync(queueFilePath, JSON.stringify(pendingDispatches, null, 2) + "\n");
+    // Replacing the queue only after its complete contents exist in a sibling
+    // file prevents a process kill from corrupting the last durable queue.
+    writeFileSync(temporaryQueueFilePath, JSON.stringify(pendingDispatches, null, 2) + "\n");
+    renameSync(temporaryQueueFilePath, queueFilePath);
     return true;
   } catch (writeError) {
+    // A failed write or rename can leave the sibling file behind. Its cleanup
+    // is best-effort for the same reason queue persistence itself is best-effort.
+    try {
+      unlinkSync(temporaryQueueFilePath);
+    } catch {
+      // The temporary file may not have been created, or it may have been renamed already.
+    }
     emitQueueWarning(
       `could not write pending teach dispatch queue: ${String(writeError?.message ?? writeError)}`
     );
@@ -89,13 +100,13 @@ export function clearPendingDispatch(dispatchId) {
 }
 
 /**
- * Atomically-in-intent hands pending work to startup recovery. Empty the
- * durable queue before dispatching so an immediate second process restart
- * cannot duplicate entries that this process already owns.
+ * Loads fresh work for startup recovery while retaining it durably until the
+ * re-dispatched work settles and clears its own entry. A crash at any point
+ * during recovery therefore leaves entries on disk for the next startup;
+ * only a settled dispatch clears its entry. Stale entries are durably dropped.
  */
-export function takePendingDispatches(maximumAgeMilliseconds) {
+export function loadPendingDispatchesForRecovery(maximumAgeMilliseconds) {
   const existingPendingDispatches = readPendingDispatches();
-  writePendingDispatches([]);
 
   const currentTimeMilliseconds = Date.now();
   const earliestAcceptedCreatedAt = currentTimeMilliseconds - maximumAgeMilliseconds;
@@ -110,5 +121,6 @@ export function takePendingDispatches(maximumAgeMilliseconds) {
     }
   }
 
+  writePendingDispatches(pendingDispatches);
   return { pendingDispatches, droppedStaleCount };
 }

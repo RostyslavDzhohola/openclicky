@@ -48,9 +48,11 @@ const { ensureTeachSkillInstalled, teachSkillInstallState } = await import(
   "./src/teachSkill.mjs"
 );
 const { watchWorkspaceLessons } = await import("./src/lessonWatcher.mjs");
-const { clearPendingDispatch, recordPendingDispatch, takePendingDispatches } = await import(
-  "./src/teachDispatchQueue.mjs"
-);
+const {
+  clearPendingDispatch,
+  loadPendingDispatchesForRecovery,
+  recordPendingDispatch,
+} = await import("./src/teachDispatchQueue.mjs");
 
 const SIDECAR_VERSION = "1.0.0";
 
@@ -78,15 +80,26 @@ function armChatIdleReset() {
  * teachError event the app speaks, and success surfaces as the existing
  * lessonCreated event from the watcher.
  */
-async function dispatchTeachInstructions({ backend, model, topicText, instructions }) {
-  const requestId = `teach-dispatch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+async function dispatchTeachInstructions({
+  backend,
+  model,
+  topicText,
+  instructions,
+  priorQueueEntry = null,
+}) {
+  const requestId =
+    priorQueueEntry?.id ??
+    `teach-dispatch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  // Recovery must preserve the first enqueue time: otherwise a crashlooping
+  // sidecar would refresh the 24-hour staleness window on every restart.
+  const recordedCreatedAt = priorQueueEntry?.createdAt ?? Date.now();
   recordPendingDispatch({
     id: requestId,
     backend,
     model,
     topicText,
     instructions,
-    createdAt: Date.now(),
+    createdAt: recordedCreatedAt,
   });
 
   let workspace;
@@ -337,18 +350,21 @@ ensureTeachSkillInstalled(null).catch((bootstrapError) => {
   emitLog("warn", `teach skill bootstrap failed: ${bootstrapError?.message ?? bootstrapError}`);
 });
 
-const { pendingDispatches, droppedStaleCount } = takePendingDispatches(24 * 60 * 60 * 1000);
+const { pendingDispatches, droppedStaleCount } = loadPendingDispatchesForRecovery(
+  24 * 60 * 60 * 1000
+);
 for (const pendingDispatch of pendingDispatches) {
   emitLog(
     "info",
     `recovering pending teach dispatch → ${pendingDispatch.backend} topic=${pendingDispatch.topicText}`
   );
-  // Re-dispatching creates a fresh durable entry before any lesson work starts.
+  // The entry stays durable until this recovered dispatch settles.
   void dispatchTeachInstructions({
     backend: pendingDispatch.backend,
     model: pendingDispatch.model,
     topicText: pendingDispatch.topicText,
     instructions: pendingDispatch.instructions,
+    priorQueueEntry: pendingDispatch,
   });
 }
 if (droppedStaleCount > 0) {

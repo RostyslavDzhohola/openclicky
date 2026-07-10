@@ -1,13 +1,20 @@
 import { afterEach, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applicationSupportDirectory } from "../../src/appSupport.mjs";
 import {
   clearPendingDispatch,
+  loadPendingDispatchesForRecovery,
   recordPendingDispatch,
-  takePendingDispatches,
 } from "../../src/teachDispatchQueue.mjs";
 
 let applicationSupportSandboxDirectory;
@@ -29,6 +36,15 @@ function pendingDispatchesFilePath() {
   return join(applicationSupportDirectory(), "pending-teach-dispatches.json");
 }
 
+function assertNoTemporaryQueueFilesRemain() {
+  const queueFileName = "pending-teach-dispatches.json";
+  const temporaryQueueFileNames = readdirSync(applicationSupportDirectory()).filter((fileName) =>
+    fileName.startsWith(`${queueFileName}.`) && fileName.endsWith(".tmp")
+  );
+
+  assert.deepEqual(temporaryQueueFileNames, []);
+}
+
 beforeEach(() => {
   previousApplicationSupportDirectory = process.env.CLICKY_APP_SUPPORT;
   applicationSupportSandboxDirectory = mkdtempSync(
@@ -46,41 +62,46 @@ afterEach(() => {
   rmSync(applicationSupportSandboxDirectory, { recursive: true, force: true });
 });
 
-test("record, clear, and take preserve pending dispatch entries", () => {
+test("record and clear round-trip a pending dispatch entry", () => {
   const pendingDispatch = pendingDispatchEntry();
   recordPendingDispatch(pendingDispatch);
+  assertNoTemporaryQueueFilesRemain();
 
   clearPendingDispatch("missing-dispatch");
-  const firstTakeResult = takePendingDispatches(60_000);
-  assert.deepEqual(firstTakeResult, {
+  assert.deepEqual(loadPendingDispatchesForRecovery(60_000), {
     pendingDispatches: [pendingDispatch],
     droppedStaleCount: 0,
   });
+  assertNoTemporaryQueueFilesRemain();
 
-  recordPendingDispatch(pendingDispatch);
   clearPendingDispatch(pendingDispatch.id);
-  assert.deepEqual(takePendingDispatches(60_000), {
+  assertNoTemporaryQueueFilesRemain();
+  assert.deepEqual(loadPendingDispatchesForRecovery(60_000), {
     pendingDispatches: [],
     droppedStaleCount: 0,
   });
+  assertNoTemporaryQueueFilesRemain();
 });
 
 test("record replaces a pending dispatch with the same id", () => {
   recordPendingDispatch(pendingDispatchEntry({ instructions: "Create an introductory lesson." }));
+  assertNoTemporaryQueueFilesRemain();
   const replacementPendingDispatch = pendingDispatchEntry({
     instructions: "Create an advanced lesson.",
     model: "gpt-5.1",
   });
 
   recordPendingDispatch(replacementPendingDispatch);
+  assertNoTemporaryQueueFilesRemain();
 
-  assert.deepEqual(takePendingDispatches(60_000), {
+  assert.deepEqual(loadPendingDispatchesForRecovery(60_000), {
     pendingDispatches: [replacementPendingDispatch],
     droppedStaleCount: 0,
   });
+  assertNoTemporaryQueueFilesRemain();
 });
 
-test("take discards stale dispatches and returns fresh dispatches", () => {
+test("recovery drops stale dispatches from the durable queue and counts them", () => {
   const maximumDispatchAgeMilliseconds = 60_000;
   const freshPendingDispatch = pendingDispatchEntry({ id: "fresh-dispatch" });
   const stalePendingDispatch = pendingDispatchEntry({
@@ -88,39 +109,72 @@ test("take discards stale dispatches and returns fresh dispatches", () => {
     createdAt: Date.now() - maximumDispatchAgeMilliseconds - 1,
   });
   recordPendingDispatch(freshPendingDispatch);
+  assertNoTemporaryQueueFilesRemain();
   recordPendingDispatch(stalePendingDispatch);
+  assertNoTemporaryQueueFilesRemain();
 
-  assert.deepEqual(takePendingDispatches(maximumDispatchAgeMilliseconds), {
+  assert.deepEqual(loadPendingDispatchesForRecovery(maximumDispatchAgeMilliseconds), {
     pendingDispatches: [freshPendingDispatch],
     droppedStaleCount: 1,
   });
+  assert.deepEqual(JSON.parse(readFileSync(pendingDispatchesFilePath(), "utf8")), [freshPendingDispatch]);
+  assertNoTemporaryQueueFilesRemain();
 });
 
-test("take empties the queue after returning pending dispatches", () => {
-  recordPendingDispatch(pendingDispatchEntry());
+test("recovery retains fresh entries until their re-dispatched work settles", () => {
+  const pendingDispatch = pendingDispatchEntry();
+  recordPendingDispatch(pendingDispatch);
+  assertNoTemporaryQueueFilesRemain();
 
-  takePendingDispatches(60_000);
+  const firstRecoveryResult = loadPendingDispatchesForRecovery(60_000);
+  assertNoTemporaryQueueFilesRemain();
+  const secondRecoveryResult = loadPendingDispatchesForRecovery(60_000);
+  assertNoTemporaryQueueFilesRemain();
 
-  assert.deepEqual(takePendingDispatches(60_000), {
+  assert.deepEqual(firstRecoveryResult, {
+    pendingDispatches: [pendingDispatch],
+    droppedStaleCount: 0,
+  });
+  assert.deepEqual(secondRecoveryResult, {
+    pendingDispatches: [pendingDispatch],
+    droppedStaleCount: 0,
+  });
+  assert.deepEqual(JSON.parse(readFileSync(pendingDispatchesFilePath(), "utf8")), [pendingDispatch]);
+  assertNoTemporaryQueueFilesRemain();
+});
+
+test("clearing a recovered dispatch removes it after its work settles", () => {
+  const recoveredPendingDispatch = pendingDispatchEntry();
+  recordPendingDispatch(recoveredPendingDispatch);
+  assertNoTemporaryQueueFilesRemain();
+
+  assert.deepEqual(loadPendingDispatchesForRecovery(60_000).pendingDispatches, [recoveredPendingDispatch]);
+  assertNoTemporaryQueueFilesRemain();
+  clearPendingDispatch(recoveredPendingDispatch.id);
+  assertNoTemporaryQueueFilesRemain();
+
+  assert.deepEqual(loadPendingDispatchesForRecovery(60_000), {
     pendingDispatches: [],
     droppedStaleCount: 0,
   });
-  assert.deepEqual(JSON.parse(readFileSync(pendingDispatchesFilePath(), "utf8")), []);
+  assertNoTemporaryQueueFilesRemain();
 });
 
 test("corrupt queue files are treated as an empty queue", () => {
   mkdirSync(applicationSupportDirectory(), { recursive: true });
   writeFileSync(pendingDispatchesFilePath(), "this is not JSON");
 
-  assert.deepEqual(takePendingDispatches(60_000), {
+  assert.deepEqual(loadPendingDispatchesForRecovery(60_000), {
     pendingDispatches: [],
     droppedStaleCount: 0,
   });
+  assertNoTemporaryQueueFilesRemain();
 });
 
 test("a missing queue file is treated as an empty queue", () => {
-  assert.deepEqual(takePendingDispatches(60_000), {
+  assert.deepEqual(loadPendingDispatchesForRecovery(60_000), {
     pendingDispatches: [],
     droppedStaleCount: 0,
   });
+  assertNoTemporaryQueueFilesRemain();
 });
