@@ -87,10 +87,11 @@ async function dispatchTeachInstructions({ backend, model, topicText, instructio
     regenerateLessonsDashboard();
     watchWorkspaceLessons(workspace.id, backend);
 
-    // Lesson quality beats latency: dispatched teach turns always use the
-    // deepest reasoning tier the backend accepts, regardless of the panel's
-    // thinking setting. The chat plane keeps the user's own configuration.
-    const lessonEffortLevel = backend === "codex" ? "xhigh" : "max";
+    // Lesson quality beats latency: dispatched teach turns always run at a
+    // deep reasoning tier regardless of the panel's thinking setting — codex
+    // at its top tier, claude at "high" (its "max" is disproportionately slow
+    // for lesson work). The chat plane keeps the user's own configuration.
+    const lessonEffortLevel = backend === "codex" ? "xhigh" : "high";
 
     const groundedInstructions =
       instructions +
