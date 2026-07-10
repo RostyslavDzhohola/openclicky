@@ -48,6 +48,9 @@ const { ensureTeachSkillInstalled, teachSkillInstallState } = await import(
   "./src/teachSkill.mjs"
 );
 const { watchWorkspaceLessons } = await import("./src/lessonWatcher.mjs");
+const { clearPendingDispatch, recordPendingDispatch, takePendingDispatches } = await import(
+  "./src/teachDispatchQueue.mjs"
+);
 
 const SIDECAR_VERSION = "1.0.0";
 
@@ -76,6 +79,16 @@ function armChatIdleReset() {
  * lessonCreated event from the watcher.
  */
 async function dispatchTeachInstructions({ backend, model, topicText, instructions }) {
+  const requestId = `teach-dispatch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  recordPendingDispatch({
+    id: requestId,
+    backend,
+    model,
+    topicText,
+    instructions,
+    createdAt: Date.now(),
+  });
+
   let workspace;
   try {
     workspace = createWorkspace(topicText);
@@ -99,7 +112,7 @@ async function dispatchTeachInstructions({ backend, model, topicText, instructio
       "\n\nin any quiz, randomize which option position holds the correct answer, and keep all options the same length and word count so formatting gives no clues.";
 
     const dispatchArguments = {
-      requestId: `teach-dispatch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      requestId,
       workspaceId: workspace.id,
       model,
       effort: lessonEffortLevel,
@@ -127,6 +140,9 @@ async function dispatchTeachInstructions({ backend, model, topicText, instructio
       topicName: topicText,
       message: String(dispatchError?.message ?? dispatchError),
     });
+  } finally {
+    // Only an abrupt process death should leave work in the durable queue.
+    clearPendingDispatch(requestId);
   }
 }
 
@@ -320,6 +336,24 @@ for (const workspace of listWorkspaces()) {
 ensureTeachSkillInstalled(null).catch((bootstrapError) => {
   emitLog("warn", `teach skill bootstrap failed: ${bootstrapError?.message ?? bootstrapError}`);
 });
+
+const { pendingDispatches, droppedStaleCount } = takePendingDispatches(24 * 60 * 60 * 1000);
+for (const pendingDispatch of pendingDispatches) {
+  emitLog(
+    "info",
+    `recovering pending teach dispatch → ${pendingDispatch.backend} topic=${pendingDispatch.topicText}`
+  );
+  // Re-dispatching creates a fresh durable entry before any lesson work starts.
+  void dispatchTeachInstructions({
+    backend: pendingDispatch.backend,
+    model: pendingDispatch.model,
+    topicText: pendingDispatch.topicText,
+    instructions: pendingDispatch.instructions,
+  });
+}
+if (droppedStaleCount > 0) {
+  emitLog("info", `dropped ${droppedStaleCount} stale pending teach dispatches`);
+}
 
 const stdinReader = createInterface({ input: process.stdin });
 
