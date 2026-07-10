@@ -43,6 +43,19 @@ struct LessonListing: Identifiable {
     let fileURL: URL
 }
 
+struct LessonBuildInProgress {
+    let topicName: String
+    let startedAt: Date
+}
+
+/// A spoken line mirrored as a typed-out bubble beside the blue Clicky cursor
+/// (rendered by BlueCursorView). The id makes two identical consecutive lines
+/// compare as different, so onChange re-fires and the bubble re-types.
+nonisolated struct SpokenResponseBubble: Equatable, Sendable {
+    let id: UUID
+    let text: String
+}
+
 @MainActor
 final class CompanionManager: ObservableObject {
     @Published private(set) var voiceState: CompanionVoiceState = .idle
@@ -53,6 +66,17 @@ final class CompanionManager: ObservableObject {
     @Published private(set) var hasMicrophonePermission = false
     @Published private(set) var hasScreenContentPermission = false
     @Published private(set) var hasSpeechRecognitionPermission = false
+
+    /// Lesson builds currently running in the sidecar (workspaceId → build info).
+    /// Non-empty makes the panel show a "building your lesson" row; entries clear
+    /// on lessonCreated / teachBuildCompleted / teachBuildCancelled / teachError, with a 30-minute
+    /// staleness fallback in case the sidecar dies before a terminal event arrives.
+    @Published private(set) var lessonBuildsInProgress: [String: LessonBuildInProgress] = [:]
+
+    /// The line the TTS is currently reading, mirrored as a typewriter bubble
+    /// beside the blue cursor so the user can read along. Nil hides the bubble.
+    @Published private(set) var spokenResponseBubble: SpokenResponseBubble?
+    private var spokenResponseBubbleClearTask: Task<Void, Never>?
 
     /// Screen location (global AppKit coords) of a detected UI element the
     /// buddy should fly to and point at. Parsed from the brain response;
@@ -87,6 +111,7 @@ final class CompanionManager: ObservableObject {
     /// Per-turn guard so the long-turn reassurance is scheduled at most once,
     /// even though tool-use status events fire repeatedly during a turn.
     private var hasScheduledLongTurnAcknowledgementForCurrentTurn = false
+    private var activeTTSTraceGeneration: UUID?
 
     private var shortcutTransitionCancellable: AnyCancellable?
     private var voiceStateCancellable: AnyCancellable?
@@ -336,18 +361,30 @@ final class CompanionManager: ObservableObject {
         return topicName
     }
 
-    /// Cleans up a lesson HTML file name for display: drops the leading `NNNN-`
-    /// ordering prefix and the `.html` suffix, then turns hyphens into spaces.
+    /// Cleans up a lesson HTML file name for display: drops the `.html` suffix,
+    /// turns the leading `NNNN-` ordering prefix into a spoken "Lesson N:" label
+    /// (so the menu shows the lesson's number, not just its title), and turns the
+    /// remaining hyphens into spaces.
     private static func lessonDisplayTitle(fromFileName lessonFileName: String) -> String {
         var title = lessonFileName
         if title.hasSuffix(".html") {
             title = String(title.dropLast(".html".count))
         }
-        // Strip a leading numeric ordering prefix like "0003-".
+
+        // Pull off a leading numeric ordering prefix like "0003-" and render it
+        // as "Lesson 3:". The stored number is zero-padded, so drop the padding
+        // for display. A file without the prefix just shows its cleaned title.
+        var lessonNumberLabel = ""
         if let prefixRange = title.range(of: #"^\d+-"#, options: .regularExpression) {
+            let numericPrefix = title[prefixRange].dropLast() // trailing "-"
+            if let lessonNumber = Int(numericPrefix) {
+                lessonNumberLabel = "Lesson \(lessonNumber): "
+            }
             title.removeSubrange(prefixRange)
         }
-        return title.replacingOccurrences(of: "-", with: " ")
+
+        let cleanedTitle = title.replacingOccurrences(of: "-", with: " ")
+        return lessonNumberLabel + cleanedTitle
     }
 
     private var selectedModelAlias: String {
@@ -393,10 +430,12 @@ final class CompanionManager: ObservableObject {
         bindShortcutTransitions()
         ScreenshotFileStore.sweepStaleCaptures()
 
-        // When the brain writes a new lesson, open it in the user's default
-        // editor unless the agent already opened it itself.
+        // Clicky opens each lesson unless the completed turn's shell commands
+        // show the agent already did, so openedByAgent deduplication produces
+        // exactly one browser tab either way.
         sidecarManager.onLessonCreated = { [weak self] lesson in
             guard let self else { return }
+            self.lessonBuildsInProgress.removeValue(forKey: lesson.workspaceId)
             if lesson.openedByAgent == false {
                 NSWorkspace.shared.open(URL(fileURLWithPath: lesson.path))
             }
@@ -411,11 +450,93 @@ final class CompanionManager: ObservableObject {
 
         sidecarManager.onTeachError = { [weak self] teachError in
             guard let self else { return }
+            if let workspaceId = teachError.workspaceId {
+                self.lessonBuildsInProgress.removeValue(forKey: workspaceId)
+            } else {
+                // Without a workspace id there is nothing to match — clear everything
+                // rather than leave an indicator that can never complete.
+                self.lessonBuildsInProgress.removeAll()
+            }
             print("⚠️ Companion teach dispatch failed for \(teachError.topicName): \(teachError.message)")
             Task { @MainActor in
                 try? await self.textToSpeechClient.speakText(
                     "hit a snag while building your \(teachError.topicName) lesson — mind trying that again?"
                 )
+            }
+        }
+
+        sidecarManager.onTeachBuildStarted = { [weak self] build in
+            guard let self else { return }
+            let startedAt = Date()
+            self.lessonBuildsInProgress[build.workspaceId] = LessonBuildInProgress(
+                topicName: build.topicName,
+                startedAt: startedAt
+            )
+            // Staleness fallback: if the sidecar dies mid-build, lessonCreated and
+            // teachError both never arrive; drop the entry after 30 minutes. The
+            // startedAt check keeps a stale sweep from clearing a NEWER build that
+            // reused the same workspace.
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 30 * 60 * 1_000_000_000)
+                guard let self else { return }
+                if let entry = self.lessonBuildsInProgress[build.workspaceId], entry.startedAt == startedAt {
+                    self.lessonBuildsInProgress.removeValue(forKey: build.workspaceId)
+                }
+            }
+        }
+
+        sidecarManager.onTeachBuildCancelled = { [weak self] workspaceId in
+            guard let self else { return }
+            self.lessonBuildsInProgress.removeValue(forKey: workspaceId)
+        }
+
+        sidecarManager.onTeachBuildCompleted = { [weak self] workspaceId in
+            guard let self else { return }
+            self.lessonBuildsInProgress.removeValue(forKey: workspaceId)
+        }
+
+        sidecarManager.onSpeakText = { [weak self] spokenEvent in
+            guard let self else { return }
+            let spokenLine = spokenEvent.text
+            // The sidecar chose to speak early, which means the turn is definitely
+            // long-running — the generic long-turn reassurance would only talk over
+            // this more specific line, so stand it down for the rest of the turn.
+            self.longTurnAcknowledgementTask?.cancel()
+            self.longTurnAcknowledgementTask = nil
+            self.hasScheduledLongTurnAcknowledgementForCurrentTurn = true
+            self.displaySpokenTextBubble(spokenLine)
+            if let traceId = spokenEvent.traceId {
+                self.sidecarManager.tracePresentation(
+                    event: "presentation.displayed",
+                    traceId: traceId,
+                    turnId: traceId,
+                    fields: ["text": spokenLine]
+                )
+            }
+            Task { @MainActor in
+                let traceGeneration = spokenEvent.traceId.map {
+                    self.prepareTTSTrace(traceId: $0, turnId: $0, spokenText: spokenLine)
+                }
+                do {
+                    try await self.textToSpeechClient.speakText(spokenLine)
+                    if let traceId = spokenEvent.traceId, let traceGeneration {
+                        self.markTTSPlaybackStartedAndMonitorCompletion(
+                            traceId: traceId,
+                            turnId: traceId,
+                            traceGeneration: traceGeneration
+                        )
+                    }
+                } catch {
+                    if let traceId = spokenEvent.traceId {
+                        self.activeTTSTraceGeneration = nil
+                        self.sidecarManager.tracePresentation(
+                            event: "tts.failed",
+                            traceId: traceId,
+                            turnId: traceId,
+                            fields: ["message": error.localizedDescription]
+                        )
+                    }
+                }
             }
         }
 
@@ -666,6 +787,8 @@ final class CompanionManager: ObservableObject {
             // Cancel any in-progress response and TTS from a previous utterance
             currentResponseTask?.cancel()
             textToSpeechClient.stopPlayback()
+            spokenResponseBubbleClearTask?.cancel()
+            spokenResponseBubble = nil
             clearDetectedElementLocation()
 
             ClickyAnalytics.trackPushToTalkStarted()
@@ -737,7 +860,7 @@ final class CompanionManager: ObservableObject {
                     return (data: capture.imageData, label: capture.label + dimensionInfo)
                 }
 
-                let fullResponseText = try await brain.respond(
+                let brainResponse = try await brain.respond(
                     transcript: transcript,
                     images: labeledImages,
                     backend: selectedBackend,
@@ -751,6 +874,7 @@ final class CompanionManager: ObservableObject {
                         }
                     }
                 )
+                let fullResponseText = brainResponse.text
 
                 // The turn produced its result — stand down the long-turn
                 // reassurance so it never speaks over the real response.
@@ -764,6 +888,23 @@ final class CompanionManager: ObservableObject {
                 // never sees a [TEACH:...] tag anymore.
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
                 let spokenText = parseResult.spokenText
+                var presentationTraceFields: [String: Any] = ["text": spokenText]
+                if let pointCoordinate = parseResult.coordinate {
+                    presentationTraceFields["pointX"] = pointCoordinate.x
+                    presentationTraceFields["pointY"] = pointCoordinate.y
+                }
+                if let elementLabel = parseResult.elementLabel {
+                    presentationTraceFields["pointLabel"] = elementLabel
+                }
+                if let screenNumber = parseResult.screenNumber {
+                    presentationTraceFields["screenNumber"] = screenNumber
+                }
+                sidecarManager.tracePresentation(
+                    event: "presentation.prepared",
+                    traceId: brainResponse.traceId,
+                    turnId: brainResponse.turnId,
+                    fields: presentationTraceFields
+                )
 
                 // Handle element pointing if the brain returned coordinates.
                 // Switch to idle BEFORE setting the location so the triangle
@@ -825,13 +966,42 @@ final class CompanionManager: ObservableObject {
                 // Play the response via TTS. Keep the spinner (processing state)
                 // until the audio actually starts playing, then switch to responding.
                 if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    displaySpokenTextBubble(spokenText)
+                    sidecarManager.tracePresentation(
+                        event: "presentation.displayed",
+                        traceId: brainResponse.traceId,
+                        turnId: brainResponse.turnId,
+                        fields: ["text": spokenText]
+                    )
                     do {
+                        let traceGeneration = prepareTTSTrace(
+                            traceId: brainResponse.traceId,
+                            turnId: brainResponse.turnId,
+                            spokenText: spokenText
+                        )
                         try await textToSpeechClient.speakText(spokenText)
+                        markTTSPlaybackStartedAndMonitorCompletion(
+                            traceId: brainResponse.traceId,
+                            turnId: brainResponse.turnId,
+                            traceGeneration: traceGeneration
+                        )
                         // speakText returns after player.play() — audio is now playing
                         voiceState = .responding
                     } catch {
+                        activeTTSTraceGeneration = nil
+                        sidecarManager.tracePresentation(
+                            event: "tts.failed",
+                            traceId: brainResponse.traceId,
+                            turnId: brainResponse.turnId,
+                            fields: ["message": error.localizedDescription]
+                        )
                         ClickyAnalytics.trackTTSError(error: error.localizedDescription)
                         print("⚠️ Companion TTS error: \(error)")
+                        // The read-along bubble was shown before speakText; a failed
+                        // utterance must not leave it lingering while the unrelated
+                        // fallback line plays.
+                        spokenResponseBubbleClearTask?.cancel()
+                        spokenResponseBubble = nil
                         speakGenericErrorFallback()
                     }
                 }
@@ -859,6 +1029,71 @@ final class CompanionManager: ObservableObject {
     /// schedule it more than once. Waits 8 seconds and, only if the turn is
     /// still running (task not cancelled), speaks a single reassuring line. This
     /// deliberately does NOT change voiceState — the processing spinner stays.
+    /// Mirrors a spoken line as a typed-out bubble beside the blue cursor so
+    /// the user can read along with the TTS (BlueCursorView renders it with
+    /// the same typewriter rhythm as the pointing bubble). Cleared 3 seconds
+    /// after TTS playback actually finishes — or immediately when the user
+    /// starts a new utterance.
+    private func displaySpokenTextBubble(_ spokenText: String) {
+        let responseBubble = SpokenResponseBubble(id: UUID(), text: spokenText)
+        spokenResponseBubble = responseBubble
+
+        spokenResponseBubbleClearTask?.cancel()
+        spokenResponseBubbleClearTask = Task { @MainActor [weak self] in
+            // The bubble is displayed just before speakText() starts the
+            // utterance, so isPlaying is briefly still false here. Give
+            // playback a moment to begin before treating "not playing" as
+            // "finished" — otherwise the bubble would clear mid-speech.
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard let self, !Task.isCancelled else { return }
+
+            while self.textToSpeechClient.isPlaying {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                guard !Task.isCancelled else { return }
+            }
+
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled else { return }
+            // Only clear the bubble this task was armed for — a newer line
+            // owns its own clear task.
+            if self.spokenResponseBubble?.id == responseBubble.id {
+                self.spokenResponseBubble = nil
+            }
+        }
+    }
+
+    private func prepareTTSTrace(traceId: String, turnId: String, spokenText: String) -> UUID {
+        let traceGeneration = UUID()
+        activeTTSTraceGeneration = traceGeneration
+        sidecarManager.tracePresentation(
+            event: "tts.requested",
+            traceId: traceId,
+            turnId: turnId,
+            fields: ["text": spokenText]
+        )
+        return traceGeneration
+    }
+
+    private func markTTSPlaybackStartedAndMonitorCompletion(
+        traceId: String,
+        turnId: String,
+        traceGeneration: UUID
+    ) {
+        guard activeTTSTraceGeneration == traceGeneration else { return }
+        sidecarManager.tracePresentation(event: "tts.started", traceId: traceId, turnId: turnId)
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            while self.textToSpeechClient.isPlaying {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                guard self.activeTTSTraceGeneration == traceGeneration else { return }
+            }
+            guard self.activeTTSTraceGeneration == traceGeneration else { return }
+            self.activeTTSTraceGeneration = nil
+            self.sidecarManager.tracePresentation(event: "tts.completed", traceId: traceId, turnId: turnId)
+        }
+    }
+
     private func scheduleLongTurnAcknowledgementIfNeeded() {
         guard !hasScheduledLongTurnAcknowledgementForCurrentTurn else { return }
         hasScheduledLongTurnAcknowledgementForCurrentTurn = true

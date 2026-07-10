@@ -999,6 +999,23 @@ struct CompanionPanelView: View {
             Text("say \"teach me …\" to start a topic")
                 .font(.system(size: 10))
                 .foregroundColor(DS.Colors.textTertiary)
+
+            ForEach(companionManager.lessonBuildsInProgress.sorted(by: { $0.key < $1.key }), id: \.key) { buildEntry in
+                HStack(spacing: 6) {
+                    LessonBuildSpinner()
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("building your \(buildEntry.value.topicName) lesson…")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(DS.Colors.textPrimary)
+
+                        Text("usually a few minutes — it'll open on its own")
+                            .font(.system(size: 10))
+                            .foregroundColor(DS.Colors.textTertiary)
+                    }
+                }
+                .padding(.top, 2)
+            }
         }
         .padding(.vertical, 4)
     }
@@ -1155,6 +1172,33 @@ struct CompanionPanelView: View {
         }
     }
 
+}
+
+// MARK: - Lesson Build Spinner
+
+/// Small always-spinning arc for the lesson-build row. Custom instead of
+/// ProgressView because the native small spinner renders nearly invisible on
+/// the panel's dark background — and the panel is a reused NSPanel whose views
+/// never re-fire onAppear, so deriving the rotation from the clock keeps it
+/// spinning without any animation state that would need (re)starting.
+private struct LessonBuildSpinner: View {
+    var body: some View {
+        TimelineView(.animation) { timelineContext in
+            let rotationPeriodSeconds: Double = 0.9
+            let elapsedSeconds = timelineContext.date.timeIntervalSinceReferenceDate
+            let rotationFraction = elapsedSeconds
+                .truncatingRemainder(dividingBy: rotationPeriodSeconds) / rotationPeriodSeconds
+
+            Circle()
+                .trim(from: 0, to: 0.72)
+                .stroke(
+                    DS.Colors.textSecondary,
+                    style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
+                )
+                .rotationEffect(.degrees(rotationFraction * 360))
+                .frame(width: 12, height: 12)
+        }
+    }
 }
 
 // MARK: - Sidecar Status Row

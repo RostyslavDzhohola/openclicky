@@ -24,6 +24,7 @@ test("topics appear with slug and lesson count; general and dot-dirs are exclude
   const lessonsDirectory = join(sandboxRoot, "css-flexbox", "lessons");
   mkdirSync(lessonsDirectory, { recursive: true });
   writeFileSync(join(lessonsDirectory, "0001-intro.html"), "<html></html>");
+  writeFileSync(join(lessonsDirectory, "cancelled-0002-layout.html"), "<html></html>");
   mkdirSync(join(sandboxRoot, ".chat"), { recursive: true });
 
   const rosterText = buildTopicRosterText();

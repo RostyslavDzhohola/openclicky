@@ -31,21 +31,21 @@ struct SidecarRequestError: Error, LocalizedError {
     }
 }
 
-struct SidecarWorkspace: Identifiable {
+nonisolated struct SidecarWorkspace: Identifiable, Sendable {
     let id: String
     let name: String
     let path: String
     let lessonCount: Int
 }
 
-struct SidecarAuthStatus {
+nonisolated struct SidecarAuthStatus: Sendable {
     let claudeLoggedIn: Bool
     let claudeMethod: String
     let codexLoggedIn: Bool
     let teachSkillInstalled: Bool
 }
 
-struct SidecarEvent {
+nonisolated struct SidecarEvent {
     let rawPayload: [String: Any]
 
     var id: String? { rawPayload["id"] as? String }
@@ -68,6 +68,12 @@ struct SidecarEvent {
     var path: String? { rawPayload["path"] as? String }
     var openedByAgent: Bool? { rawPayload["openedByAgent"] as? Bool }
     var level: String? { rawPayload["level"] as? String }
+    var traceId: String? { rawPayload["traceId"] as? String }
+    var turnId: String? { rawPayload["turnId"] as? String }
+    var parentTurnId: String? { rawPayload["parentTurnId"] as? String }
+    var dispatchId: String? { rawPayload["dispatchId"] as? String }
+    var interviewId: String? { rawPayload["interviewId"] as? String }
+    var agentRole: String? { rawPayload["agentRole"] as? String }
 
     var workspace: SidecarWorkspace? {
         guard let workspacePayload = rawPayload["workspace"] as? [String: Any] else { return nil }
@@ -92,7 +98,7 @@ struct SidecarEvent {
         )
     }
 
-    private static func parseWorkspace(from payload: [String: Any]) -> SidecarWorkspace? {
+    private nonisolated static func parseWorkspace(from payload: [String: Any]) -> SidecarWorkspace? {
         guard let id = payload["id"] as? String,
               let name = payload["name"] as? String,
               let path = payload["path"] as? String else {
@@ -140,13 +146,28 @@ final class SidecarProcessManager: ObservableObject {
 
     /// Fired when a background lesson dispatch fails after the chat turn already
     /// completed — the app speaks this, since no request is pending to throw to.
-    var onTeachError: (((topicName: String, message: String)) -> Void)?
+    var onTeachError: (((workspaceId: String?, topicName: String, message: String)) -> Void)?
+
+    /// Fired when the sidecar wants a line spoken immediately, before the
+    /// request's final result exists (e.g. the course-setup ack that would
+    /// otherwise be silent until the synchronous interview turn finishes).
+    var onSpeakText: (((text: String, traceId: String?)) -> Void)?
+
+    /// Fired when a background lesson build begins; paired with lessonCreated,
+    /// teachBuildCompleted, teachBuildCancelled, or teachError so the UI can show a persistent indicator.
+    var onTeachBuildStarted: (((workspaceId: String, topicName: String)) -> Void)?
+    var onTeachBuildCompleted: ((String) -> Void)?
+    var onTeachBuildCancelled: ((String) -> Void)?
 
     private let userDefaults = UserDefaults.standard
     private let fileManager = FileManager.default
     private let nodePathDefaultsKey = "clickyNodePath"
     private let sidecarDevPathDefaultsKey = "clickySidecarDevPath"
     private let anthropicAPIKeyDefaultsKey = "clickyAnthropicAPIKey"
+    private let sidecarStandardInputWriteQueue = DispatchQueue(
+        label: "com.openclicky.sidecar-standard-input-writes",
+        qos: .userInitiated
+    )
 
     private var sidecarProcess: Process?
     private var sidecarInputPipe: Pipe?
@@ -224,7 +245,7 @@ final class SidecarProcessManager: ObservableObject {
         text: String,
         images: [(path: String, label: String)],
         onStatus: (@MainActor @Sendable (SidecarEvent) -> Void)?
-    ) async throws -> String {
+    ) async throws -> CompanionBrainResponse {
         let event = try await sendRequest(
             id: requestId,
             payload: [
@@ -242,7 +263,11 @@ final class SidecarProcessManager: ObservableObject {
         guard let text = event.text else {
             throw SidecarRequestError(code: "internal", message: "Chat result did not include text", backend: backend)
         }
-        return text
+        return CompanionBrainResponse(
+            traceId: event.traceId ?? requestId,
+            turnId: requestId,
+            text: text
+        )
     }
 
     func sendOneShot(
@@ -335,6 +360,25 @@ final class SidecarProcessManager: ObservableObject {
         ])
     }
 
+    func tracePresentation(
+        event: String,
+        traceId: String,
+        turnId: String,
+        fields: [String: Any] = [:]
+    ) {
+        #if DEBUG
+        guard sidecarProcess?.isRunning == true else { return }
+        var payload = fields
+        payload["id"] = UUID().uuidString
+        payload["type"] = "agentTrace"
+        payload["event"] = event
+        payload["traceId"] = traceId
+        payload["turnId"] = turnId
+        payload["agentRole"] = "chat"
+        writeFireAndForgetRequest(payload)
+        #endif
+    }
+
     func stop() {
         intentionallyStopped = true
         restartTask?.cancel()
@@ -346,7 +390,7 @@ final class SidecarProcessManager: ObservableObject {
             writeFireAndForgetRequest(["id": UUID().uuidString, "type": "shutdown"])
         }
 
-        sidecarInputPipe?.fileHandleForWriting.closeFile()
+        closeSidecarStandardInputAfterQueuedWrites()
 
         let processToTerminate = sidecarProcess
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
@@ -593,12 +637,18 @@ final class SidecarProcessManager: ObservableObject {
                     statusHandlers[id] = onStatus
                 }
 
-                do {
-                    try writeRequest(payload)
-                } catch {
-                    pendingRequests.removeValue(forKey: id)
-                    statusHandlers.removeValue(forKey: id)
-                    continuation.resume(throwing: error)
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+
+                    do {
+                        try await self.writeRequest(payload)
+                    } catch {
+                        guard let pendingContinuation = self.pendingRequests.removeValue(forKey: id) else {
+                            return
+                        }
+                        self.statusHandlers.removeValue(forKey: id)
+                        pendingContinuation.resume(throwing: error)
+                    }
                 }
             }
         } onCancel: {
@@ -622,13 +672,38 @@ final class SidecarProcessManager: ObservableObject {
 
     private func writeFireAndForgetRequest(_ payload: [String: Any]) {
         do {
-            try writeRequest(payload)
+            let preparedRequest = try prepareRequestForWriting(payload)
+            sidecarStandardInputWriteQueue.async {
+                do {
+                    try preparedRequest.inputFileHandle.write(contentsOf: preparedRequest.lineData)
+                } catch {
+                    print("🧠 sidecar: failed to write fire-and-forget request: \(error)")
+                }
+            }
         } catch {
             print("🧠 sidecar: failed to write fire-and-forget request: \(error)")
         }
     }
 
-    private func writeRequest(_ payload: [String: Any]) throws {
+    private func writeRequest(_ payload: [String: Any]) async throws {
+        let preparedRequest = try prepareRequestForWriting(payload)
+
+        try await withCheckedThrowingContinuation { continuation in
+            sidecarStandardInputWriteQueue.async {
+                do {
+                    try preparedRequest.inputFileHandle.write(contentsOf: preparedRequest.lineData)
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func prepareRequestForWriting(_ payload: [String: Any]) throws -> (
+        inputFileHandle: FileHandle,
+        lineData: Data
+    ) {
         guard let inputFileHandle = sidecarInputPipe?.fileHandleForWriting else {
             throw SidecarRequestError(code: "internal", message: "Sidecar stdin is unavailable", backend: nil)
         }
@@ -636,7 +711,17 @@ final class SidecarProcessManager: ObservableObject {
         let jsonData = try JSONSerialization.data(withJSONObject: payload, options: [])
         var lineData = jsonData
         lineData.append(0x0A)
-        try inputFileHandle.write(contentsOf: lineData)
+        return (inputFileHandle: inputFileHandle, lineData: lineData)
+    }
+
+    private func closeSidecarStandardInputAfterQueuedWrites() {
+        guard let inputFileHandle = sidecarInputPipe?.fileHandleForWriting else { return }
+
+        // Closing on the same serial queue keeps shutdown behind every request
+        // already submitted and prevents the close itself from blocking the UI.
+        sidecarStandardInputWriteQueue.async {
+            inputFileHandle.closeFile()
+        }
     }
 
     private func handleSidecarStdoutData(_ data: Data) {
@@ -702,8 +787,29 @@ final class SidecarProcessManager: ObservableObject {
                 ))
             }
 
+        case "speak":
+            if let text = event.text, !text.isEmpty {
+                onSpeakText?((text: text, traceId: event.traceId ?? event.turnId))
+            }
+
+        case "teachBuildStarted":
+            if let workspaceId = event.workspaceId {
+                onTeachBuildStarted?((workspaceId: workspaceId, topicName: event.topicName ?? "your topic"))
+            }
+
+        case "teachBuildCancelled":
+            if let workspaceId = event.workspaceId {
+                onTeachBuildCancelled?(workspaceId)
+            }
+
+        case "teachBuildCompleted":
+            if let workspaceId = event.workspaceId {
+                onTeachBuildCompleted?(workspaceId)
+            }
+
         case "teachError":
             onTeachError?((
+                workspaceId: event.workspaceId,
                 topicName: event.topicName ?? "your topic",
                 message: event.message ?? "lesson generation failed"
             ))
@@ -873,6 +979,9 @@ final class SidecarProcessManager: ObservableObject {
 
     private func sidecarEnvironment(nodePath: String) -> [String: String] {
         var environment = installEnvironment(nodePath: nodePath)
+        #if DEBUG
+        environment["CLICKY_AGENT_TRACE"] = "1"
+        #endif
         if let anthropicAPIKey = userDefaults.string(forKey: anthropicAPIKeyDefaultsKey), !anthropicAPIKey.isEmpty {
             environment["CLICKY_ANTHROPIC_API_KEY"] = anthropicAPIKey
         }
@@ -1028,7 +1137,7 @@ private extension Array where Element == Int {
     }
 }
 
-private final class SidecarProcessCompletionState: @unchecked Sendable {
+private nonisolated final class SidecarProcessCompletionState: @unchecked Sendable {
     private let lock = NSLock()
     private var hasCompleted = false
 
@@ -1043,8 +1152,9 @@ private final class SidecarProcessCompletionState: @unchecked Sendable {
 }
 
 /// Thread-safe byte accumulator for draining a child process pipe from its
-/// readability callback, which fires on a background queue.
-private final class SidecarPipeOutputAccumulator: @unchecked Sendable {
+/// readability callback, which fires on a background queue. The lock protects
+/// every access to the mutable collected data.
+private nonisolated final class SidecarPipeOutputAccumulator: @unchecked Sendable {
     private let lock = NSLock()
     private var collectedData = Data()
 

@@ -59,13 +59,15 @@ npm run drive:resume -- --backend claude                             # context s
 npm run drive:teach -- --backend claude --topic "css flexbox"        # full lesson generation (minutes)
 npm run drive:workspaces                                             # workspace creation + listing
 npm run drive:split -- --backend codex                               # chat plane: TEACH dispatch + idle reset (minutes)
+npm run drive:interview -- --backend claude                          # new-topic mission interview → MISSION.md → lesson build (minutes)
 
 npm test                                                             # fast unit tests (no model calls)
 ```
 
 The chat plane's inactivity reset defaults to 10 minutes; the drive sandbox
 shortens it to 3 seconds via `CLICKY_CHAT_IDLE_MS` so `drive:split` can prove
-the ephemeral session forgets. Each drive run gets fresh `mkdtemp` state dirs —
+the ephemeral session forgets (`drive:interview` raises it back to 2 minutes,
+because the mission interview needs chat context to survive between answers). Each drive run gets fresh `mkdtemp` state dirs —
 stateful modes are only repeatable on a clean lessons root.
 
 Note: if you `npm install` here for terminal testing, this `node_modules` gets
@@ -80,8 +82,12 @@ Requests (stdin): `chat`, `oneShot`, `createWorkspace`, `listWorkspaces`,
 
 Events (stdout): `ready`, `status` (per-turn progress), `result`, `error`
 (codes: `auth_required`, `skill_install_failed`, `workspace_missing`,
-`cancelled`, `node_backend_crash`, `internal`), `lessonCreated`
-(with `openedByAgent` so exactly one browser tab opens), `teachError`
-(a dispatched background lesson failed — skill install or teach turn), `log`.
+`cancelled`, `node_backend_crash`, `internal`), `speak` (a line the app
+voices immediately — the course-setup ack before the synchronous interview
+turn, and the finished-build announcement after a dispatch), `teachBuildStarted` (a background lesson
+build began; pairs with `lessonCreated`/`teachError` for progress UI),
+`lessonCreated` (with `openedByAgent` so exactly one browser tab opens),
+`teachError` (a dispatched background lesson failed — skill install or
+teach turn), `log`.
 
 Diagnostics go to stderr; stdout is protocol-only.

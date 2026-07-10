@@ -6,6 +6,8 @@
 // its lifetime can never outlive the app that spawned it.
 
 import { createInterface } from "node:readline";
+import { spawn } from "node:child_process";
+import { join } from "node:path";
 import { sanitizeProcessEnvForSubscriptionAuth } from "./src/env.mjs";
 
 // Must happen before any SDK import spawns a child process.
@@ -14,6 +16,7 @@ sanitizeProcessEnvForSubscriptionAuth();
 const { emitEvent, emitError, emitLog, parseRequestLine } = await import(
   "./src/protocol.mjs"
 );
+const { traceAgentEvent } = await import("./src/agentTrace.mjs");
 const { checkAuthStatus } = await import("./src/auth.mjs");
 const {
   createWorkspace,
@@ -23,10 +26,28 @@ const {
   listWorkspaces,
   lessonsRootDirectory,
   workspaceExists,
+  workspacePath,
+  slugifyTopicName,
   CHAT_WORKSPACE_ID,
   GENERAL_WORKSPACE_ID,
 } = await import("./src/workspaces.mjs");
 const { parseTeachTag } = await import("./src/teachTag.mjs");
+const { parseCancelTag } = await import("./src/cancelTag.mjs");
+const { parseOpenTag, resolveOpenLessonPath } = await import("./src/openTag.mjs");
+const {
+  createTeachDispatchRegistry,
+  listLessonFileNames,
+  quarantineLessonFilesCreatedDuringDispatch,
+} = await import("./src/teachDispatchRegistry.mjs");
+const {
+  INTERVIEW_PREAMBLE,
+  LESSON_GROUNDING_NOTE,
+  POST_INTERVIEW_BUILD_INSTRUCTIONS,
+  INTERVIEW_WRAP_UP_NOTE,
+  BUILD_HANDOFF_SPOKEN_NOTE,
+  missionFileExists,
+  createInterviewTracker,
+} = await import("./src/teachInterview.mjs");
 const { buildTopicRosterText, composeChatTurnText } = await import("./src/topicRoster.mjs");
 const { regenerateLessonsDashboard, lessonsDashboardPath } = await import(
   "./src/lessonsDashboard.mjs"
@@ -47,17 +68,172 @@ const {
 const { ensureTeachSkillInstalled, teachSkillInstallState } = await import(
   "./src/teachSkill.mjs"
 );
-const { watchWorkspaceLessons } = await import("./src/lessonWatcher.mjs");
+const {
+  beginTeachTurnHold,
+  endTeachTurnHold,
+  watchWorkspaceLessons,
+} = await import("./src/lessonWatcher.mjs");
 const {
   clearPendingDispatch,
   loadPendingDispatchesForRecovery,
   recordPendingDispatch,
 } = await import("./src/teachDispatchQueue.mjs");
+const {
+  buildLessonCompletionAnnouncement,
+  lessonFileNamesCreatedDuringDispatch,
+} = await import("./src/teachCompletion.mjs");
 
 const SIDECAR_VERSION = "1.0.0";
 
 const CHAT_IDLE_RESET_MS = Number(process.env.CLICKY_CHAT_IDLE_MS ?? 600_000);
 let chatIdleResetTimer = null;
+const interviewTracker = createInterviewTracker();
+const INTERVIEW_IDLE_EXPIRY_MS = Number(process.env.CLICKY_INTERVIEW_IDLE_MS ?? 600_000);
+let interviewExpiryTimer = null;
+// Cancels that arrive between the chat turn and the interview turn hit no
+// in-flight backend turn; remember them so a cancelled setup never arms
+// interview routing (entries are dropped when their chat request finishes).
+const cancelledChatRequestIds = new Set();
+const teachDispatchRegistry = createTeachDispatchRegistry();
+
+function handleOpenLessonRequest(openRequest, correlation = {}) {
+  if (!openRequest) {
+    return { opened: false, failureSpokenText: null };
+  }
+
+  const resolution = resolveOpenLessonPath({
+    lessonsRootDirectory: lessonsRootDirectory(),
+    topicSlug: openRequest.topicSlug,
+    lessonOrdinal: openRequest.lessonOrdinal,
+  });
+  if (!resolution.lessonPath) {
+    traceAgentEvent("open.requested", {
+      ...correlation,
+      topicSlug: openRequest.topicSlug,
+      lessonOrdinal: openRequest.lessonOrdinal ?? "latest",
+      failureReason: resolution.failureReason,
+    });
+    emitLog(
+      "info",
+      `open lesson failed slug=${openRequest.topicSlug} ordinal=${openRequest.lessonOrdinal ?? "latest"} reason=${resolution.failureReason}`
+    );
+    return {
+      opened: false,
+      failureSpokenText: "hmm, actually i couldn't find that lesson to open.",
+    };
+  }
+
+  traceAgentEvent("open.requested", {
+    ...correlation,
+    topicSlug: openRequest.topicSlug,
+    lessonOrdinal: openRequest.lessonOrdinal ?? "latest",
+    resolvedPath: resolution.lessonPath,
+  });
+
+  emitLog(
+    "info",
+    `open lesson slug=${openRequest.topicSlug} ordinal=${openRequest.lessonOrdinal ?? "latest"} file=${resolution.lessonPath}`
+  );
+  const openProcess = spawn("open", [resolution.lessonPath], {
+    detached: true,
+    stdio: "ignore",
+  });
+  openProcess.on("error", (openError) => {
+    emitLog(
+      "info",
+      `open lesson failed slug=${openRequest.topicSlug} file=${resolution.lessonPath} reason=${String(openError?.message ?? openError)}`
+    );
+    const text = "hmm, i couldn't open that lesson.";
+    traceAgentEvent("response.emitted", { ...correlation, channel: "speak", text });
+    emitEvent({ type: "speak", text, ...correlation });
+  });
+  openProcess.unref();
+  return { opened: true, failureSpokenText: null };
+}
+
+function appendOpenLessonFailureToSpokenReply(spokenReplyText, openLessonOutcome) {
+  if (!openLessonOutcome?.failureSpokenText) {
+    return spokenReplyText;
+  }
+
+  return [spokenReplyText.trim(), openLessonOutcome.failureSpokenText]
+    .filter((spokenReplyPart) => spokenReplyPart.length > 0)
+    .join(" ");
+}
+
+function parseChatResponseTags(responseText) {
+  const teachTagResult = parseTeachTag(responseText);
+  const cancelTagResult = parseCancelTag(teachTagResult.cleanedText);
+  const openTagResult = parseOpenTag(cancelTagResult.cleanedText);
+  return {
+    cleanedText: openTagResult.cleanedText,
+    teachDispatch: teachTagResult.dispatch,
+    cancelRequest: cancelTagResult.cancelRequest,
+    openRequest: openTagResult.openRequest,
+  };
+}
+
+function sanitizeSpeechOnlyText(responseText, { sourceDescription }) {
+  const originalText = String(responseText ?? "");
+  const containedTeachProtocolTag = /\[TEACH:[^\[\]]*(?::[^\[\]]*)?\]/i.test(originalText);
+  const containedCancelProtocolTag = /\[\s*CANCEL\s*:\s*[^\[\]]*\]/i.test(originalText);
+  const teachTagResult = parseTeachTag(originalText);
+  const cancelTagResult = parseCancelTag(teachTagResult.cleanedText);
+  const openTagResult = parseOpenTag(cancelTagResult.cleanedText);
+
+  if (containedTeachProtocolTag) {
+    emitLog("warn", `ignoring leaked teach tag from ${sourceDescription}`);
+  }
+  if (containedCancelProtocolTag) {
+    emitLog("warn", `ignoring leaked cancel tag from ${sourceDescription}`);
+  }
+
+  // These call sites are speech-only: unlike normal chat routing, every
+  // protocol tag is a leak to discard rather than an instruction to execute.
+  return openTagResult.cleanedText.replace(/\[POINT:[^\]]*\]/gi, "").trim();
+}
+
+async function handleCancelLessonBuildRequest(cancelRequest) {
+  if (!cancelRequest) return;
+
+  const activeDispatch = teachDispatchRegistry.activeDispatch(cancelRequest.topicSlug);
+  if (!activeDispatch) {
+    emitLog(
+      "info",
+      `cancel lesson build ignored slug=${cancelRequest.topicSlug} reason=no_active_dispatch`
+    );
+    return;
+  }
+
+  emitLog(
+    "info",
+    `cancelling lesson build slug=${cancelRequest.topicSlug} requestId=${activeDispatch.requestId}`
+  );
+  await teachDispatchRegistry.requestCancellation(cancelRequest.topicSlug, {
+    cancelBackendTurn: async (entry) => {
+      try {
+        if (await cancelClaudeTurn(entry.requestId)) {
+          return true;
+        }
+      } catch (claudeCancellationError) {
+        emitLog(
+          "warn",
+          `claude lesson cancellation failed requestId=${entry.requestId} reason=${String(claudeCancellationError?.message ?? claudeCancellationError)}`
+        );
+      }
+
+      try {
+        return await cancelCodexTurn(entry.requestId);
+      } catch (codexCancellationError) {
+        emitLog(
+          "warn",
+          `codex lesson cancellation failed requestId=${entry.requestId} reason=${String(codexCancellationError?.message ?? codexCancellationError)}`
+        );
+        return false;
+      }
+    },
+  });
+}
 
 function armChatIdleReset() {
   clearTimeout(chatIdleResetTimer);
@@ -74,22 +250,111 @@ function armChatIdleReset() {
   chatIdleResetTimer.unref?.();
 }
 
+function clearInterviewExpiryTimer() {
+  clearTimeout(interviewExpiryTimer);
+  interviewExpiryTimer = null;
+}
+
+function armInterviewExpiry() {
+  clearInterviewExpiryTimer();
+  interviewExpiryTimer = setTimeout(() => {
+    const activeInterview = interviewTracker.activeInterview;
+    if (activeInterview) {
+      emitLog(
+        "info",
+        `interview idle window elapsed — abandoning the mission interview for ${activeInterview.workspaceId}`
+      );
+      traceAgentEvent("interview.expired", {
+        traceId: activeInterview.traceId,
+        parentTurnId: activeInterview.parentTurnId,
+        interviewId: activeInterview.interviewId,
+        agentRole: "topic-interview",
+        workspaceId: activeInterview.workspaceId,
+      });
+      interviewTracker.expire();
+    }
+    interviewExpiryTimer = null;
+  }, INTERVIEW_IDLE_EXPIRY_MS);
+  // Never keep the process alive just for the interview expiry timer.
+  interviewExpiryTimer.unref?.();
+}
+
+async function prepareTeachWorkspace({
+  topicText,
+  backend,
+  shouldEmitTeachError = () => true,
+}) {
+  const workspace = createWorkspace(topicText);
+  const teachInstall = await ensureTeachSkillInstalled(workspace.path);
+  if (!teachInstall.installed) {
+    // Evaluate this after the async install attempt so a cancellation that
+    // arrived during setup can suppress a stale spoken failure event.
+    if (shouldEmitTeachError()) {
+      emitEvent({
+        type: "teachError",
+        workspaceId: workspace.id,
+        topicName: topicText,
+        message: teachInstall.message,
+      });
+    }
+    return null;
+  }
+  regenerateLessonsDashboard();
+  watchWorkspaceLessons(workspace.id, backend);
+  return workspace;
+}
+
 /**
  * Builds a lesson in the topic's persistent teach session, in the background.
  * The chat result has already been emitted — failures surface as a dedicated
- * teachError event the app speaks, and success surfaces as the existing
- * lessonCreated event from the watcher.
+ * teachError event the app speaks. Successful builds always emit
+ * teachBuildCompleted, while new lessons also surface through lessonCreated.
  */
 async function dispatchTeachInstructions({
   backend,
   model,
   topicText,
   instructions,
+  traceId,
+  parentTurnId,
+  interviewId,
   priorQueueEntry = null,
 }) {
+  const workspaceIdForTopic = slugifyTopicName(topicText);
+  if (teachDispatchRegistry.activeDispatch(workspaceIdForTopic)) {
+    emitLog(
+      "info",
+      `teach dispatch skipped topic=${topicText} reason=build_already_in_flight`
+    );
+    return;
+  }
+
+  // A recovered dispatch reuses its durable entry's id so the entry stays
+  // owned by (and is cleared with) this dispatch rather than duplicating.
   const requestId =
     priorQueueEntry?.id ??
     `teach-dispatch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const dispatchEntry = teachDispatchRegistry.beginDispatch({
+    workspaceId: workspaceIdForTopic,
+    requestId,
+    backend,
+    topicText,
+  });
+  if (!dispatchEntry) {
+    emitLog(
+      "info",
+      `teach dispatch skipped topic=${topicText} reason=build_already_in_flight`
+    );
+    return;
+  }
+
+  const correlation = {
+    traceId: traceId ?? parentTurnId ?? requestId,
+    parentTurnId,
+    dispatchId: requestId,
+    interviewId,
+    agentRole: "topic-builder",
+  };
   // Recovery must preserve the first enqueue time: otherwise a crashlooping
   // sidecar would refresh the 24-hour staleness window on every restart.
   const recordedCreatedAt = priorQueueEntry?.createdAt ?? Date.now();
@@ -100,18 +365,72 @@ async function dispatchTeachInstructions({
     topicText,
     instructions,
     createdAt: recordedCreatedAt,
+    ...correlation,
   });
+  traceAgentEvent("teach.queued", { ...correlation, backend, model, topicText });
 
   let workspace;
+  let spokenWrapUpText = "";
+  let teachTurnHoldStarted = false;
+  let teachBuildStartedWasEmitted = false;
+  let lessonFileNamesBeforeDispatch = [];
+  let dispatchWasCancelled = false;
+
+  function finishCancelledDispatch() {
+    dispatchWasCancelled = true;
+    let quarantinedLessonFileNames = [];
+    if (workspace) {
+      try {
+        quarantinedLessonFileNames = quarantineLessonFilesCreatedDuringDispatch({
+          lessonsDirectory: join(workspace.path, "lessons"),
+          lessonFileNamesBeforeDispatch,
+        });
+      } catch (lessonCleanupError) {
+        emitLog(
+          "warn",
+          `cancelled teach dispatch cleanup failed workspace=${workspace.id} reason=${String(lessonCleanupError?.message ?? lessonCleanupError)}`
+        );
+      }
+      if (teachTurnHoldStarted) {
+        endTeachTurnHold(workspace.id, { discardQueuedLessons: true });
+        teachTurnHoldStarted = false;
+      }
+      if (quarantinedLessonFileNames.length > 0) {
+        regenerateLessonsDashboard();
+      }
+    }
+
+    emitLog(
+      "info",
+      `teach dispatch cancelled workspace=${workspace?.id ?? workspaceIdForTopic} quarantinedLessonFiles=${JSON.stringify(quarantinedLessonFileNames)}`
+    );
+    traceAgentEvent("agent.cancelled", {
+      ...correlation,
+      workspaceId: workspace?.id ?? workspaceIdForTopic,
+    });
+    if (teachBuildStartedWasEmitted) {
+      emitEvent({
+        type: "teachBuildCancelled",
+        workspaceId: workspace.id,
+        topicName: topicText,
+        ...correlation,
+      });
+    }
+  }
+
   try {
-    workspace = createWorkspace(topicText);
-    const teachInstall = await ensureTeachSkillInstalled(workspace.path);
-    if (!teachInstall.installed) {
-      emitEvent({ type: "teachError", workspaceId: workspace.id, topicName: topicText, message: teachInstall.message });
+    workspace = await prepareTeachWorkspace({
+      topicText,
+      backend,
+      shouldEmitTeachError: () => !dispatchEntry.cancellationRequested,
+    });
+    if (dispatchEntry.cancellationRequested) {
+      finishCancelledDispatch();
       return;
     }
-    regenerateLessonsDashboard();
-    watchWorkspaceLessons(workspace.id, backend);
+    if (!workspace) return;
+
+    lessonFileNamesBeforeDispatch = listLessonFileNames(join(workspace.path, "lessons"));
 
     // Lesson quality beats latency: dispatched teach turns always run at a
     // deep reasoning tier regardless of the panel's thinking setting — codex
@@ -119,10 +438,7 @@ async function dispatchTeachInstructions({
     // for lesson work). The chat plane keeps the user's own configuration.
     const lessonEffortLevel = backend === "codex" ? "xhigh" : "high";
 
-    const groundedInstructions =
-      instructions +
-      "\n\nbefore writing the lesson, use web search to ground your understanding of this topic in current, accurate information — verify key facts and examples rather than relying on memory." +
-      "\n\nin any quiz, randomize which option position holds the correct answer, and keep all options the same length and word count so formatting gives no clues.";
+    const groundedInstructions = instructions + LESSON_GROUNDING_NOTE;
 
     const dispatchArguments = {
       requestId,
@@ -132,31 +448,229 @@ async function dispatchTeachInstructions({
       text: groundedInstructions,
       images: [],
       teachIntent: true,
-      onStatus: null,
+      onStatus: (statusUpdate) => {
+        if (statusUpdate.phase === "thinking") return;
+        traceAgentEvent(
+          statusUpdate.phase === "capability" ? "capability.unavailable" : "agent.tool",
+          { ...correlation, workspaceId: workspace.id, ...statusUpdate }
+        );
+      },
     };
+    if (dispatchEntry.cancellationRequested) {
+      finishCancelledDispatch();
+      return;
+    }
+
     emitLog(
       "info",
-      `teach dispatch → ${backend} model=${model ?? "default"} effort=${lessonEffortLevel} workspace=${workspace.id}`
+      `teach dispatch → ${backend} model=${model ?? "default"} effort=${lessonEffortLevel} workspace=${workspace.id} instructions="${String(instructions).slice(0, 300).replace(/\r?\n/g, " ")}"`
     );
+    beginTeachTurnHold(workspace.id, backend, correlation);
+    teachTurnHoldStarted = true;
+    traceAgentEvent("teach.started", { ...correlation, workspaceId: workspace.id, backend, model });
+    traceAgentEvent("agent.started", { ...correlation, workspaceId: workspace.id, backend, model });
+    emitEvent({
+      type: "teachBuildStarted",
+      workspaceId: workspace.id,
+      topicName: topicText,
+      ...correlation,
+    });
+    teachBuildStartedWasEmitted = true;
     let turnResult;
     if (backend === "codex") {
       turnResult = await runCodexChatTurn(dispatchArguments);
     } else {
       turnResult = await runClaudeChatTurn(dispatchArguments);
     }
+
+    if (dispatchEntry.cancellationRequested) {
+      finishCancelledDispatch();
+      return;
+    }
+
+    // The final tool commands, including a non-compliant agent's `open`, are
+    // available only after the teach turn resolves. Flush lesson events now
+    // so the app and its spoken completion announcement stay in lockstep.
+    endTeachTurnHold(workspace.id);
+    teachTurnHoldStarted = false;
     const resultPreview = String(turnResult?.text ?? "").slice(0, 200);
     emitLog("info", `teach dispatch for ${workspace.id} finished: ${resultPreview}`);
-  } catch (dispatchError) {
-    emitEvent({
-      type: "teachError",
-      workspaceId: workspace?.id ?? null,
-      topicName: topicText,
-      message: String(dispatchError?.message ?? dispatchError),
+    traceAgentEvent("agent.completed", {
+      ...correlation,
+      workspaceId: workspace.id,
+      text: String(turnResult?.text ?? ""),
+      durationMs: turnResult?.durationMs,
     });
+    traceAgentEvent("teach.completed", { ...correlation, workspaceId: workspace.id });
+
+    const lessonFileNamesAfterDispatch = listLessonFileNames(join(workspace.path, "lessons"));
+    const createdLessonFileNames = lessonFileNamesCreatedDuringDispatch({
+      lessonFileNamesBeforeDispatch,
+      lessonFileNamesAfterDispatch,
+    });
+    if (createdLessonFileNames.length > 0) {
+      spokenWrapUpText = buildLessonCompletionAnnouncement(topicText);
+    }
+    emitEvent({
+      type: "teachBuildCompleted",
+      workspaceId: workspace.id,
+      topicName: topicText,
+      ...correlation,
+    });
+  } catch (dispatchError) {
+    if (
+      dispatchError?.clickyErrorCode === "cancelled" ||
+      dispatchEntry.cancellationRequested
+    ) {
+      finishCancelledDispatch();
+    } else {
+      if (teachTurnHoldStarted && workspace) {
+        endTeachTurnHold(workspace.id);
+        teachTurnHoldStarted = false;
+      }
+      traceAgentEvent("agent.failed", {
+        ...correlation,
+        workspaceId: workspace?.id,
+        message: String(dispatchError?.message ?? dispatchError),
+      });
+      traceAgentEvent("teach.failed", {
+        ...correlation,
+        workspaceId: workspace?.id,
+        message: String(dispatchError?.message ?? dispatchError),
+      });
+      emitEvent({
+        type: "teachError",
+        workspaceId: workspace?.id ?? null,
+        topicName: topicText,
+        message: String(dispatchError?.message ?? dispatchError),
+        ...correlation,
+      });
+    }
   } finally {
+    if (teachTurnHoldStarted && workspace) {
+      endTeachTurnHold(workspace.id, {
+        discardQueuedLessons:
+          dispatchWasCancelled || dispatchEntry.cancellationRequested,
+      });
+    }
     // Only an abrupt process death should leave work in the durable queue.
     clearPendingDispatch(requestId);
+    teachDispatchRegistry.settleDispatch(workspaceIdForTopic, dispatchEntry);
   }
+
+  // Emit speech after the hold flush: if Clicky needs to open the page, the
+  // user sees that single app-side open immediately before this announcement.
+  if (spokenWrapUpText.length > 0) {
+    traceAgentEvent("response.emitted", {
+      ...correlation,
+      workspaceId: workspace?.id,
+      channel: "speak",
+      text: spokenWrapUpText,
+    });
+    emitEvent({ type: "speak", text: spokenWrapUpText, workspaceId: workspace?.id, ...correlation });
+  }
+}
+
+async function startInterview({
+  backend,
+  model,
+  effort,
+  topicText,
+  instructions,
+  requestId,
+  onStatus,
+  traceId,
+  interviewId,
+}) {
+  const workspace = await prepareTeachWorkspace({ topicText, backend });
+  if (!workspace) return null;
+
+  const correlation = {
+    traceId,
+    turnId: requestId,
+    parentTurnId: requestId,
+    interviewId,
+    agentRole: "topic-interview",
+  };
+  const interviewTurnArguments = {
+    requestId,
+    workspaceId: workspace.id,
+    model,
+    effort,
+    text: instructions + "\n\n" + INTERVIEW_PREAMBLE,
+    images: [],
+    teachIntent: true,
+    onStatus: (statusUpdate) => onStatus?.(statusUpdate, correlation),
+  };
+
+  // Interview turns are intentionally not durable: after a crash, a missing
+  // MISSION.md safely causes the next teach request to begin again.
+  traceAgentEvent("interview.started", { ...correlation, workspaceId: workspace.id, backend, model });
+  traceAgentEvent("agent.started", { ...correlation, workspaceId: workspace.id, backend, model });
+  beginTeachTurnHold(workspace.id, backend, correlation);
+  let turnResult;
+  try {
+    turnResult =
+      backend === "codex"
+        ? await runCodexChatTurn(interviewTurnArguments)
+        : await runClaudeChatTurn(interviewTurnArguments);
+  } finally {
+    // A mission interview should not build a lesson, but this hold preserves
+    // correct notification ordering if a model does so despite the prompt.
+    endTeachTurnHold(workspace.id);
+  }
+
+  traceAgentEvent("agent.completed", {
+    ...correlation,
+    workspaceId: workspace.id,
+    text: turnResult.text,
+    durationMs: turnResult.durationMs,
+  });
+
+  return {
+    workspace,
+    replyText: turnResult.text,
+    lessonCountBeforeInterview: workspace.lessonCount,
+  };
+}
+
+function concludeInterviewIfMissionCaptured() {
+  const activeInterview = interviewTracker.activeInterview;
+  if (!activeInterview) return { missionCaptured: false, buildDispatched: false };
+  if (!missionFileExists(workspacePath(activeInterview.workspaceId))) {
+    return { missionCaptured: false, buildDispatched: false };
+  }
+
+  clearInterviewExpiryTimer();
+  const completedInterview = interviewTracker.complete();
+  emitLog("info", `mission captured for ${completedInterview.workspaceId} — concluding interview`);
+  traceAgentEvent("mission.captured", {
+    traceId: completedInterview.traceId,
+    parentTurnId: completedInterview.parentTurnId,
+    interviewId: completedInterview.interviewId,
+    agentRole: "topic-interview",
+    workspaceId: completedInterview.workspaceId,
+  });
+  // Pre-feature topics may already own lessons without a mission — only a
+  // lesson the interview itself produced means the model jumped ahead.
+  if (
+    describeWorkspace(completedInterview.workspaceId).lessonCount >
+    completedInterview.lessonCountAtInterviewStart
+  ) {
+    emitLog("info", "lesson already created during the interview — skipping build dispatch");
+    return { missionCaptured: true, buildDispatched: false };
+  }
+
+  void dispatchTeachInstructions({
+    backend: completedInterview.backend,
+    model: completedInterview.model,
+    topicText: completedInterview.topicText,
+    instructions: POST_INTERVIEW_BUILD_INSTRUCTIONS,
+    traceId: completedInterview.traceId,
+    parentTurnId: completedInterview.parentTurnId,
+    interviewId: completedInterview.interviewId,
+  });
+  return { missionCaptured: true, buildDispatched: true };
 }
 
 async function handleChatRequest(request) {
@@ -166,16 +680,159 @@ async function handleChatRequest(request) {
     !request.workspaceId || request.workspaceId === GENERAL_WORKSPACE_ID;
   const workspaceId = isChatPlaneTurn ? CHAT_WORKSPACE_ID : request.workspaceId;
 
+  const activeInterview = interviewTracker.activeInterview;
+  const traceId = activeInterview?.traceId ?? request.traceId ?? request.id;
+  const baseCorrelation = {
+    traceId,
+    turnId: request.id,
+    parentTurnId: activeInterview?.parentTurnId,
+    interviewId: activeInterview?.interviewId,
+    agentRole: activeInterview ? "topic-interview" : "chat",
+    workspaceId: activeInterview?.workspaceId ?? workspaceId,
+  };
+  traceAgentEvent("turn.received", {
+    ...baseCorrelation,
+    backend: activeInterview?.backend ?? request.backend,
+    model: activeInterview?.model ?? request.model,
+    effort: request.effort,
+    transcript: request.text ?? "",
+    imageCount: request.images?.length ?? 0,
+  });
+
+  const onStatus = (statusUpdate, correlation = baseCorrelation) => {
+    emitEvent({ id: request.id, type: "status", ...statusUpdate });
+    if (statusUpdate.phase === "thinking") return;
+    traceAgentEvent(
+      statusUpdate.phase === "capability" ? "capability.unavailable" : "agent.tool",
+      { ...correlation, ...statusUpdate }
+    );
+  };
+
+  if (isChatPlaneTurn && activeInterview) {
+    // While a mission interview is active, voice turns stay in the topic's
+    // teach session just as they would for a CLI user answering its questions.
+    clearTimeout(chatIdleResetTimer);
+    clearInterviewExpiryTimer();
+    const { turnNumber, reachedTurnCap } = interviewTracker.recordRoutedTurn();
+    traceAgentEvent("interview.turn", { ...baseCorrelation, turnNumber, reachedTurnCap });
+    if (reachedTurnCap) {
+      traceAgentEvent("interview.turn-cap", { ...baseCorrelation, turnNumber });
+    }
+    const routedText =
+      (request.text ?? "") + (reachedTurnCap ? INTERVIEW_WRAP_UP_NOTE : "");
+    const routedTurnArguments = {
+      requestId: request.id,
+      workspaceId: activeInterview.workspaceId,
+      model: activeInterview.model,
+      effort: request.effort,
+      text: routedText,
+      images: request.images ?? [],
+      teachIntent: false,
+      onStatus,
+    };
+
+    // Keep the original backend so the topic session remains continuous if
+    // the user changes the panel's backend while answering the interview.
+    watchWorkspaceLessons(activeInterview.workspaceId, activeInterview.backend);
+
+    try {
+      traceAgentEvent("agent.started", {
+        ...baseCorrelation,
+        backend: activeInterview.backend,
+        model: activeInterview.model,
+      });
+      beginTeachTurnHold(
+        activeInterview.workspaceId,
+        activeInterview.backend,
+        baseCorrelation
+      );
+      let turnResult;
+      try {
+        turnResult =
+          activeInterview.backend === "codex"
+            ? await runCodexChatTurn(routedTurnArguments)
+            : await runClaudeChatTurn(routedTurnArguments);
+      } finally {
+        // The teach skill can build a lesson mid-interview despite being told
+        // not to; defer that lesson notification until its turn is complete.
+        endTeachTurnHold(activeInterview.workspaceId);
+      }
+      const { cleanedText, teachDispatch, cancelRequest, openRequest } =
+        parseChatResponseTags(turnResult.text);
+      traceAgentEvent("agent.completed", {
+        ...baseCorrelation,
+        text: turnResult.text,
+        durationMs: turnResult.durationMs,
+      });
+      traceAgentEvent("routing.parsed", {
+        ...baseCorrelation,
+        rawResponse: turnResult.text,
+        cleanedReply: cleanedText,
+        route: cancelRequest ? "cancel" : openRequest ? "open" : "interview-continue",
+        teachTagDetected: Boolean(teachDispatch),
+      });
+      if (teachDispatch) {
+        emitLog("warn", `ignoring leaked teach tag from interview workspace ${activeInterview.workspaceId}`);
+      }
+      await handleCancelLessonBuildRequest(cancelRequest);
+      const openLessonOutcome = handleOpenLessonRequest(openRequest, baseCorrelation);
+
+      const interviewConclusion = concludeInterviewIfMissionCaptured();
+      if (!interviewConclusion.missionCaptured) {
+        if (reachedTurnCap) {
+          const expiredInterview = interviewTracker.expire();
+          emitLog(
+            "info",
+            `mission interview turn cap reached for ${expiredInterview?.workspaceId ?? activeInterview.workspaceId} without MISSION.md — returning subsequent turns to normal chat`
+          );
+        } else {
+          armInterviewExpiry();
+        }
+      }
+      let spokenReplyText = appendOpenLessonFailureToSpokenReply(
+        cleanedText,
+        openLessonOutcome
+      );
+      if (interviewConclusion.buildDispatched) {
+        // The teach session's own wrap-up ("your course is set up") says nothing
+        // about the multi-minute build that follows — set that expectation now.
+        // Appending after a trailing [POINT:...] tag would strand that tag
+        // mid-sentence, where the app's end-of-response parser cannot strip it
+        // and TTS would read it aloud. Pointing is useless on a handoff turn,
+        // so drop the tag before appending.
+        spokenReplyText =
+          spokenReplyText.replace(/\[POINT:[^\]]*\]/gi, "").trim() +
+          BUILD_HANDOFF_SPOKEN_NOTE;
+      }
+      traceAgentEvent("response.emitted", {
+        ...baseCorrelation,
+        channel: "result",
+        text: spokenReplyText,
+      });
+      emitEvent({
+        id: request.id,
+        type: "result",
+        text: spokenReplyText,
+        sessionId: turnResult.sessionId ?? null,
+        durationMs: turnResult.durationMs ?? null,
+        ...baseCorrelation,
+      });
+    } finally {
+      // A failed or cancelled routed turn still ends chat-plane activity.
+      armChatIdleReset();
+      if (interviewTracker.activeInterview) {
+        armInterviewExpiry();
+      }
+    }
+    return;
+  }
+
   if (!isChatPlaneTurn && !workspaceExists(workspaceId)) {
     emitError(request.id, "workspace_missing", `workspace "${workspaceId}" does not exist`);
     return;
   }
 
   watchWorkspaceLessons(workspaceId, request.backend);
-
-  const onStatus = (statusUpdate) => {
-    emitEvent({ id: request.id, type: "status", ...statusUpdate });
-  };
 
   let turnText = request.text ?? "";
   if (isChatPlaneTurn) {
@@ -203,34 +860,174 @@ async function handleChatRequest(request) {
   }
 
   try {
+    traceAgentEvent("agent.started", {
+      ...baseCorrelation,
+      backend: request.backend,
+      model: request.model,
+      effort: request.effort,
+    });
     const turnResult =
       request.backend === "codex"
         ? await runCodexChatTurn(chatTurnArguments)
         : await runClaudeChatTurn(chatTurnArguments);
 
+    traceAgentEvent("agent.completed", {
+      ...baseCorrelation,
+      text: turnResult.text,
+      durationMs: turnResult.durationMs,
+    });
     let responseText = turnResult.text;
     if (isChatPlaneTurn) {
-      const { cleanedText, dispatch } = parseTeachTag(responseText);
+      const { cleanedText, teachDispatch, cancelRequest, openRequest } =
+        parseChatResponseTags(responseText);
       responseText = cleanedText;
-      if (dispatch) {
-        // Fire-and-forget: a minutes-long lesson build never blocks the chat.
-        void dispatchTeachInstructions({
-          backend: request.backend,
-          model: request.model,
-          topicText: dispatch.topicText,
-          instructions: dispatch.instructions,
-        });
+      const route = cancelRequest
+        ? "cancel"
+        : openRequest
+          ? "open"
+          : teachDispatch
+            ? "teach"
+            : "normal";
+      traceAgentEvent("routing.parsed", {
+        ...baseCorrelation,
+        rawResponse: turnResult.text,
+        cleanedReply: cleanedText,
+        route,
+        teachTopic: teachDispatch?.topicText,
+        cancelTopic: cancelRequest?.topicSlug,
+        openTopic: openRequest?.topicSlug,
+      });
+      await handleCancelLessonBuildRequest(cancelRequest);
+      const openLessonOutcome = handleOpenLessonRequest(openRequest, baseCorrelation);
+      responseText = appendOpenLessonFailureToSpokenReply(
+        responseText,
+        openLessonOutcome
+      );
+      if (teachDispatch) {
+        const topicWorkspaceDirectory = workspacePath(slugifyTopicName(teachDispatch.topicText));
+        if (missionFileExists(topicWorkspaceDirectory)) {
+          // Mission already captured: a minutes-long lesson build never blocks the chat.
+          void dispatchTeachInstructions({
+            backend: request.backend,
+            model: request.model,
+            topicText: teachDispatch.topicText,
+            instructions: teachDispatch.instructions,
+            traceId,
+            parentTurnId: request.id,
+          });
+        } else {
+          // No mission yet: run the teach skill's own mission interview over voice.
+          try {
+            // The sync interview turn takes tens of seconds; speak the chat ack now so
+            // the user is not left in silence until the first interview question.
+            if (responseText.trim().length > 0) {
+              traceAgentEvent("response.emitted", {
+                ...baseCorrelation,
+                channel: "speak",
+                text: responseText,
+              });
+              emitEvent({ id: request.id, type: "speak", text: responseText, ...baseCorrelation });
+              responseText = "";
+            }
+            const interviewId = `interview-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            const interviewStart = await startInterview({
+              backend: request.backend,
+              model: request.model,
+              effort: request.effort,
+              topicText: teachDispatch.topicText,
+              instructions: teachDispatch.instructions,
+              requestId: request.id,
+              onStatus,
+              traceId,
+              interviewId,
+            });
+            if (interviewStart) {
+              if (cancelledChatRequestIds.has(request.id)) {
+                emitLog(
+                  "info",
+                  `interview start for ${interviewStart.workspace.id} was cancelled mid-setup — not arming interview routing`
+                );
+              } else {
+                const interviewReplyText = sanitizeSpeechOnlyText(
+                  interviewStart.replyText,
+                  {
+                    sourceDescription: `first interview reply from workspace ${interviewStart.workspace.id}`,
+                  }
+                );
+                responseText = [responseText, interviewReplyText]
+                  .filter((part) => part.length > 0)
+                  .join(" ");
+                interviewTracker.begin({
+                  workspaceId: interviewStart.workspace.id,
+                  backend: request.backend,
+                  model: request.model,
+                  topicText: teachDispatch.topicText,
+                  lessonCountAtInterviewStart: interviewStart.lessonCountBeforeInterview,
+                  interviewId,
+                  parentTurnId: request.id,
+                  traceId,
+                });
+                // The model may capture the mission on the first turn if the
+                // tag's instructions already include enough user context.
+                const interviewConclusion = concludeInterviewIfMissionCaptured();
+                if (!interviewConclusion.missionCaptured) {
+                  armInterviewExpiry();
+                }
+                if (interviewConclusion.buildDispatched) {
+                  // The teach session's own wrap-up ("your course is set up") says nothing
+                  // about the multi-minute build that follows — set that expectation now.
+                  responseText = responseText + BUILD_HANDOFF_SPOKEN_NOTE;
+                }
+              }
+            }
+          } catch (interviewError) {
+            // A cancelled interview turn is a cancelled chat request, not a
+            // teach failure — let the standard cancelled error path handle it.
+            if (interviewError?.clickyErrorCode === "cancelled") {
+              throw interviewError;
+            }
+            emitEvent({
+              type: "teachError",
+              workspaceId: slugifyTopicName(teachDispatch.topicText),
+              topicName: teachDispatch.topicText,
+              message: String(interviewError?.message ?? interviewError),
+            });
+          }
+        }
       }
+
+      // Preserve the existing final routing pass for any future text appended
+      // after the initial chat parse. First-interview speech is sanitized
+      // earlier, so its protocol tags are deliberately discarded before here.
+      const finalCancelTagResult = parseCancelTag(responseText);
+      const finalOpenTagResult = parseOpenTag(finalCancelTagResult.cleanedText);
+      responseText = finalOpenTagResult.cleanedText;
+      await handleCancelLessonBuildRequest(finalCancelTagResult.cancelRequest);
+      const finalOpenLessonOutcome = handleOpenLessonRequest(
+        finalOpenTagResult.openRequest,
+        baseCorrelation
+      );
+      responseText = appendOpenLessonFailureToSpokenReply(
+        responseText,
+        finalOpenLessonOutcome
+      );
     }
 
+    traceAgentEvent("response.emitted", {
+      ...baseCorrelation,
+      channel: "result",
+      text: responseText,
+    });
     emitEvent({
       id: request.id,
       type: "result",
       text: responseText,
       sessionId: turnResult.sessionId ?? null,
       durationMs: turnResult.durationMs ?? null,
+      ...baseCorrelation,
     });
   } finally {
+    cancelledChatRequestIds.delete(request.id);
     if (isChatPlaneTurn) {
       // A turn that fails or is cancelled still ends activity — the idle window must re-arm or ephemerality is lost.
       armChatIdleReset();
@@ -305,12 +1102,40 @@ async function handleRequest(request) {
     }
 
     case "cancel": {
+      traceAgentEvent("cancel.requested", {
+        traceId: request.traceId ?? request.targetId,
+        turnId: request.targetId,
+        targetId: request.targetId,
+      });
       const wasCancelled =
         (await cancelClaudeTurn(request.targetId)) ||
         (await cancelCodexTurn(request.targetId));
+      if (!wasCancelled && request.targetId) {
+        cancelledChatRequestIds.add(request.targetId);
+      }
+      traceAgentEvent("cancel.result", {
+        traceId: request.traceId ?? request.targetId,
+        turnId: request.targetId,
+        targetId: request.targetId,
+        cancelled: wasCancelled,
+      });
       emitEvent({ id: request.id, type: "result", cancelled: wasCancelled });
       break;
     }
+
+    case "agentTrace":
+      traceAgentEvent(request.event ?? "presentation.unknown", {
+        traceId: request.traceId,
+        turnId: request.turnId,
+        agentRole: request.agentRole ?? "chat",
+        text: request.text,
+        pointX: request.pointX,
+        pointY: request.pointY,
+        pointLabel: request.pointLabel,
+        screenNumber: request.screenNumber,
+        message: request.message,
+      });
+      break;
 
     case "shutdown":
       emitEvent({ id: request.id, type: "result", shuttingDown: true });
@@ -358,12 +1183,21 @@ for (const pendingDispatch of pendingDispatches) {
     "info",
     `recovering pending teach dispatch → ${pendingDispatch.backend} topic=${pendingDispatch.topicText}`
   );
-  // The entry stays durable until this recovered dispatch settles.
+  const recoveredTopicWorkspaceDirectory = workspacePath(slugifyTopicName(pendingDispatch.topicText));
+  // The entry stays durable until this recovered dispatch settles. A
+  // pre-feature durable entry can have no mission, and recovery has no chat
+  // turn available to relay an interview into.
   void dispatchTeachInstructions({
     backend: pendingDispatch.backend,
     model: pendingDispatch.model,
     topicText: pendingDispatch.topicText,
-    instructions: pendingDispatch.instructions,
+    instructions: missionFileExists(recoveredTopicWorkspaceDirectory)
+      ? pendingDispatch.instructions
+      : pendingDispatch.instructions +
+        "\n\nno one is available to answer questions in this session. if MISSION.md is missing, write a reasonable MISSION.md yourself from these instructions first, then build the lesson.",
+    traceId: pendingDispatch.traceId,
+    parentTurnId: pendingDispatch.parentTurnId,
+    interviewId: pendingDispatch.interviewId,
     priorQueueEntry: pendingDispatch,
   });
 }
@@ -382,6 +1216,13 @@ stdinReader.on("line", (line) => {
     if (errorCode !== "cancelled") {
       emitLog("error", `request ${request.id} (${request.type}) failed: ${requestError?.message ?? requestError}`);
     }
+    traceAgentEvent(errorCode === "cancelled" ? "agent.cancelled" : "agent.failed", {
+      traceId: request.traceId ?? request.id,
+      turnId: request.id,
+      agentRole: "chat",
+      backend: requestError?.clickyBackend ?? request.backend,
+      message: String(requestError?.message ?? requestError),
+    });
     emitError(request.id, errorCode, String(requestError?.message ?? requestError), requestError?.clickyBackend);
   });
 });

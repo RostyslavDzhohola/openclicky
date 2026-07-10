@@ -12,6 +12,12 @@ enum BrainStatus {
     case usingTool(name: String, detail: String)
 }
 
+struct CompanionBrainResponse {
+    let traceId: String
+    let turnId: String
+    let text: String
+}
+
 protocol CompanionBrainProvider {
     func respond(
         transcript: String,
@@ -20,7 +26,7 @@ protocol CompanionBrainProvider {
         model: String,
         effort: String,
         onStatus: @MainActor @Sendable @escaping (BrainStatus) -> Void
-    ) async throws -> String
+    ) async throws -> CompanionBrainResponse
 
     func oneShot(
         prompt: String,
@@ -59,16 +65,22 @@ final class SidecarBrainProvider: CompanionBrainProvider {
         model: String,
         effort: String,
         onStatus: @MainActor @Sendable @escaping (BrainStatus) -> Void
-    ) async throws -> String {
-        let writtenCaptures = try ScreenshotFileStore.writeCaptures(images)
-        defer { ScreenshotFileStore.cleanUp(directoryURL: writtenCaptures.directoryURL) }
+    ) async throws -> CompanionBrainResponse {
+        let writtenCaptures = try await Task.detached(priority: .utility) {
+            try ScreenshotFileStore.writeCaptures(images)
+        }.value
+        defer {
+            Task.detached(priority: .utility) {
+                ScreenshotFileStore.cleanUp(directoryURL: writtenCaptures.directoryURL)
+            }
+        }
 
         let requestId = UUID().uuidString
         let turnStartedAt = Date()
         var lastEventAt = Date()
 
         return try await withTaskCancellationHandler {
-            try await withThrowingTaskGroup(of: String.self) { taskGroup in
+            try await withThrowingTaskGroup(of: CompanionBrainResponse.self) { taskGroup in
                 taskGroup.addTask { @MainActor in
                     try await self.sidecarManager.sendChat(
                         requestId: requestId,
@@ -123,8 +135,14 @@ final class SidecarBrainProvider: CompanionBrainProvider {
         backend: String,
         systemPrompt: String
     ) async throws -> String {
-        let writtenCaptures = try ScreenshotFileStore.writeCaptures(images)
-        defer { ScreenshotFileStore.cleanUp(directoryURL: writtenCaptures.directoryURL) }
+        let writtenCaptures = try await Task.detached(priority: .utility) {
+            try ScreenshotFileStore.writeCaptures(images)
+        }.value
+        defer {
+            Task.detached(priority: .utility) {
+                ScreenshotFileStore.cleanUp(directoryURL: writtenCaptures.directoryURL)
+            }
+        }
 
         return try await sidecarManager.sendOneShot(
             backend: backend,

@@ -10,3 +10,6 @@ releases/
 # silently drop half the checked-in snapshot.
 !leanring-buddy/sidecar/teach-template/.claude/
 coding-plans/
+
+# Codex computer-use handoff reports (local debug artifacts)
+.codex-cua-reports/

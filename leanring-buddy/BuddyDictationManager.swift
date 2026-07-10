@@ -224,9 +224,194 @@ private struct BuddyDictationDraftCallbacks {
     let submitDraftText: (String) -> Void
 }
 
+/// Allows the provider-creation task to cross its async boundary without
+/// claiming that every transcription-session implementation is independently
+/// thread-safe. The session is consumed on the main actor and then owned by
+/// EarlyAudioBufferRelay, which serializes all provider delivery on its queue.
+private final class StreamingTranscriptionSessionTaskResult: @unchecked Sendable {
+    let transcriptionSession: any BuddyStreamingTranscriptionSession
+
+    init(transcriptionSession: any BuddyStreamingTranscriptionSession) {
+        self.transcriptionSession = transcriptionSession
+    }
+}
+
+/// Bridges the audio-engine tap to a transcription session that may still be
+/// starting. The tap and provider setup run on different executors, so a serial
+/// delivery queue orders attachment, startup-buffer flushing, and live audio.
+private final class EarlyAudioBufferRelay: @unchecked Sendable {
+    private struct QueuedAudioBuffer {
+        let audioBuffer: AVAudioPCMBuffer
+        let durationSeconds: TimeInterval
+    }
+
+    private static let maximumQueuedAudioDurationSeconds: TimeInterval = 15
+
+    private let stateLock = NSLock()
+    private let transcriptionProviderDeliveryQueue = DispatchQueue(
+        label: "com.openclicky.dictation.transcription-provider-audio-delivery",
+        qos: .userInitiated
+    )
+    private var queuedAudioBuffers: [QueuedAudioBuffer] = []
+    private var queuedAudioDurationSeconds: TimeInterval = 0
+    private var attachedTranscriptionSession: (any BuddyStreamingTranscriptionSession)?
+    private var hasDetectedFirstNonEmptyAudioBuffer = false
+    private var hasPrintedQueueCapacityWarning = false
+    private var isDiscarded = false
+
+    func appendOrForward(_ audioBuffer: AVAudioPCMBuffer) {
+        guard audioBuffer.frameLength > 0 else { return }
+
+        // AVAudioEngine owns and may reuse the tap's buffer after the callback
+        // returns. Every asynchronously delivered buffer therefore needs an
+        // independent copy rather than retaining mutable HAL-owned memory.
+        let sourceAudioBuffers = UnsafeMutableAudioBufferListPointer(audioBuffer.mutableAudioBufferList)
+        guard !sourceAudioBuffers.isEmpty,
+              sourceAudioBuffers.allSatisfy({ sourceAudioBuffer in
+                  sourceAudioBuffer.mData != nil && sourceAudioBuffer.mDataByteSize > 0
+              }) else {
+            return
+        }
+        guard let copiedAudioBuffer = Self.copyAudioBuffer(audioBuffer) else { return }
+
+        // The realtime render thread must never wait on Speech framework
+        // workers; doing provider delivery here creates a Thread Performance
+        // Checker priority-inversion hang risk.
+        transcriptionProviderDeliveryQueue.async { [self] in
+            stateLock.lock()
+
+            guard !isDiscarded else {
+                stateLock.unlock()
+                return
+            }
+
+            if let attachedTranscriptionSession {
+                stateLock.unlock()
+                attachedTranscriptionSession.appendAudioBuffer(copiedAudioBuffer)
+                return
+            }
+
+            let audioBufferDurationSeconds = TimeInterval(copiedAudioBuffer.frameLength)
+                / copiedAudioBuffer.format.sampleRate
+            queuedAudioBuffers.append(
+                QueuedAudioBuffer(
+                    audioBuffer: copiedAudioBuffer,
+                    durationSeconds: audioBufferDurationSeconds
+                )
+            )
+            queuedAudioDurationSeconds += audioBufferDurationSeconds
+
+            while queuedAudioDurationSeconds > Self.maximumQueuedAudioDurationSeconds,
+                  !queuedAudioBuffers.isEmpty {
+                let discardedOldestAudioBuffer = queuedAudioBuffers.removeFirst()
+                queuedAudioDurationSeconds -= discardedOldestAudioBuffer.durationSeconds
+
+                if !hasPrintedQueueCapacityWarning {
+                    hasPrintedQueueCapacityWarning = true
+                    print("⚠️ BuddyDictationManager: transcription provider startup exceeded the 15-second early-audio buffer; dropping oldest audio")
+                }
+            }
+
+            stateLock.unlock()
+        }
+    }
+
+    func markFirstNonEmptyAudioBufferDetectedIfNeeded() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+
+        guard !isDiscarded, !hasDetectedFirstNonEmptyAudioBuffer else { return false }
+        hasDetectedFirstNonEmptyAudioBuffer = true
+        return true
+    }
+
+    func attach(_ transcriptionSession: any BuddyStreamingTranscriptionSession) {
+        transcriptionProviderDeliveryQueue.async { [self] in
+            stateLock.lock()
+
+            guard !isDiscarded else {
+                stateLock.unlock()
+                return
+            }
+
+            attachedTranscriptionSession = transcriptionSession
+            let startupAudioBuffers = queuedAudioBuffers
+            queuedAudioBuffers.removeAll(keepingCapacity: false)
+            queuedAudioDurationSeconds = 0
+            stateLock.unlock()
+
+            // This flush shares the live-audio delivery queue, preserving tap
+            // order without holding the state lock across provider calls.
+            for startupAudioBuffer in startupAudioBuffers {
+                transcriptionSession.appendAudioBuffer(startupAudioBuffer.audioBuffer)
+            }
+        }
+    }
+
+    func requestFinalTranscriptAfterDeliveringPendingAudio() {
+        transcriptionProviderDeliveryQueue.async { [self] in
+            stateLock.lock()
+
+            guard !isDiscarded, let attachedTranscriptionSession else {
+                stateLock.unlock()
+                return
+            }
+
+            stateLock.unlock()
+            attachedTranscriptionSession.requestFinalTranscript()
+        }
+    }
+
+    func discard() {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+
+        isDiscarded = true
+        queuedAudioBuffers.removeAll(keepingCapacity: false)
+        queuedAudioDurationSeconds = 0
+        attachedTranscriptionSession = nil
+    }
+
+    private static func copyAudioBuffer(_ audioBuffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let copiedAudioBuffer = AVAudioPCMBuffer(
+            pcmFormat: audioBuffer.format,
+            frameCapacity: audioBuffer.frameLength
+        ) else {
+            return nil
+        }
+
+        copiedAudioBuffer.frameLength = audioBuffer.frameLength
+
+        let sourceAudioBuffers = UnsafeMutableAudioBufferListPointer(audioBuffer.mutableAudioBufferList)
+        let destinationAudioBuffers = UnsafeMutableAudioBufferListPointer(copiedAudioBuffer.mutableAudioBufferList)
+
+        for audioBufferIndex in 0..<min(sourceAudioBuffers.count, destinationAudioBuffers.count) {
+            let sourceAudioBuffer = sourceAudioBuffers[audioBufferIndex]
+            var destinationAudioBuffer = destinationAudioBuffers[audioBufferIndex]
+            let bytesToCopy = min(
+                Int(sourceAudioBuffer.mDataByteSize),
+                Int(destinationAudioBuffer.mDataByteSize)
+            )
+
+            guard bytesToCopy > 0,
+                  let sourceAudioData = sourceAudioBuffer.mData,
+                  let destinationAudioData = destinationAudioBuffer.mData else {
+                continue
+            }
+
+            destinationAudioData.copyMemory(from: sourceAudioData, byteCount: bytesToCopy)
+            destinationAudioBuffer.mDataByteSize = UInt32(bytesToCopy)
+            destinationAudioBuffers[audioBufferIndex] = destinationAudioBuffer
+        }
+
+        return copiedAudioBuffer
+    }
+}
+
 @MainActor
 final class BuddyDictationManager: NSObject, ObservableObject {
     private static let defaultFinalTranscriptFallbackDelaySeconds: TimeInterval = 2.4
+    private static let maximumTranscriptionProviderStartupWaitSeconds: TimeInterval = 15
     /// UserDefaults key holding the CoreAudio UID of the microphone the user has
     /// pinned for push-to-talk. Absent / `nil` means "use the system default
     /// input" (which is what macOS auto-routes to AirPods, the case this picker
@@ -245,6 +430,11 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     private static let recordedAudioPowerHistoryLength = 44
     private static let recordedAudioPowerHistoryBaselineLevel: CGFloat = 0.02
     private static let recordedAudioPowerHistorySampleIntervalSeconds: TimeInterval = 0.07
+    private static let microphoneReadySound: NSSound? = {
+        let microphoneReadySound = NSSound(named: NSSound.Name("Tink"))
+        microphoneReadySound?.volume = 0.25
+        return microphoneReadySound
+    }()
 
     @Published private(set) var isRecordingFromMicrophoneButton = false
     @Published private(set) var isRecordingFromKeyboardShortcut = false
@@ -302,7 +492,11 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     /// format — only a fresh engine reliably picks up the session's capture
     /// device (which we may have just made the default) and its real format.
     private var audioEngine = AVAudioEngine()
+    private var isInputTapInstalled = false
     private var activeTranscriptionSession: (any BuddyStreamingTranscriptionSession)?
+    private var activeTranscriptionSessionCreationTask: Task<StreamingTranscriptionSessionTaskResult, Error>?
+    private var activeEarlyAudioBufferRelay: EarlyAudioBufferRelay?
+    private var transcriptionProviderStartupBeganAt: Date?
     private var activeStartSource: BuddyDictationStartSource?
     private var draftCallbacks: BuddyDictationDraftCallbacks?
     private var draftTextBeforeCurrentDictation = ""
@@ -310,6 +504,11 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     private var shouldAutomaticallySubmitFinalDraft = false
     private var hasFinishedCurrentDictationSession = false
     private var finalizeFallbackWorkItem: DispatchWorkItem?
+    /// Rotated on every arm/re-arm of the final-transcript fallback so a
+    /// fallback whose work item already fired — but whose MainActor hop has
+    /// not run yet — can detect it was superseded (e.g. by provider
+    /// attachment re-arming the timer) instead of finishing the session.
+    private var currentFinalTranscriptFallbackRequestIdentifier = UUID()
     private var pendingStartRequestIdentifier = UUID()
     private var contextualKeyterms: [String] = []
     private var lastRecordedAudioPowerSampleDate = Date.distantPast
@@ -503,6 +702,11 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     /// Makes a device the system default input. Returns whether the property
     /// write succeeded.
     private func setSystemDefaultInputDevice(_ inputDeviceID: AudioDeviceID) -> Bool {
+        guard inputDeviceID != kAudioObjectUnknown else {
+            print("⚠️ BuddyDictationManager: cannot set the system default input to unknown CoreAudio device ID 0")
+            return false
+        }
+
         var defaultInputAddress = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDefaultInputDevice,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -634,9 +838,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             draftCallbacks?.updateDraftText(currentDraftText)
         }
 
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
-        activeTranscriptionSession?.cancel()
+        tearDownActiveRecognitionResources()
 
         resetSessionState()
     }
@@ -722,8 +924,8 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         shouldAutomaticallySubmitFinalDraft = shouldAutomaticallySubmitFinalDraftOnStop
         hasFinishedCurrentDictationSession = false
         isFinalizingTranscript = false
-        isRecordingFromMicrophoneButton = startSource == .microphoneButton
-        isRecordingFromKeyboardShortcut = startSource == .keyboardShortcut
+        isRecordingFromMicrophoneButton = false
+        isRecordingFromKeyboardShortcut = false
         isKeyboardShortcutSessionActiveOrFinalizing = startSource == .keyboardShortcut
         currentAudioPowerLevel = 0
         recordedAudioPowerHistory = Array(
@@ -741,21 +943,30 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         }
 
         do {
-            try await startRecognitionSession()
-            guard !Task.isCancelled else {
-                print("🎙️ BuddyDictationManager: start cancelled (shortcut released during session start)")
-                audioEngine.stop()
-                audioEngine.inputNode.removeTap(onBus: 0)
-                activeTranscriptionSession?.cancel()
+            try await startRecognitionSession(startRequestIdentifier: startRequestIdentifier)
+            guard pendingStartRequestIdentifier == startRequestIdentifier || isFinalizingTranscript else {
+                print("🎙️ BuddyDictationManager: start request superseded during session start")
+                tearDownActiveRecognitionResources()
                 resetSessionState()
                 return
             }
-            if startSource == .microphoneButton {
-                microphoneButtonRecordingStartedAt = Date()
+            guard !Task.isCancelled || isFinalizingTranscript else {
+                print("🎙️ BuddyDictationManager: start cancelled (shortcut released during session start)")
+                tearDownActiveRecognitionResources()
+                resetSessionState()
+                return
             }
-            isPreparingToRecord = false
             print("🎙️ BuddyDictationManager: recognition session started")
         } catch {
+            guard activeStartSource == startSource,
+                  pendingStartRequestIdentifier == startRequestIdentifier || isFinalizingTranscript else {
+                return
+            }
+
+            // Provider creation now happens after the engine is live, so every
+            // failure must also tear down the tap and its startup-audio relay.
+            tearDownActiveRecognitionResources()
+
             isPreparingToRecord = false
             lastErrorMessage = userFacingErrorMessage(
                 from: error,
@@ -789,60 +1000,18 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         let finalTranscriptFallbackDelaySeconds = activeTranscriptionSession?.finalTranscriptFallbackDelaySeconds
             ?? Self.defaultFinalTranscriptFallbackDelaySeconds
 
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
-        activeTranscriptionSession?.requestFinalTranscript()
-
-        finalizeFallbackWorkItem?.cancel()
-        let shouldSubmitFinalDraftWhenFallbackTriggers = shouldAutomaticallySubmitFinalDraft
-        let fallbackWorkItem = DispatchWorkItem { [weak self] in
-            Task { @MainActor in
-                self?.finishCurrentDictationSessionIfNeeded(
-                    shouldSubmitFinalDraft: shouldSubmitFinalDraftWhenFallbackTriggers
-                )
-            }
+        stopAudioEngineAndRemoveInputTapIfInstalled()
+        if let activeEarlyAudioBufferRelay {
+            activeEarlyAudioBufferRelay.requestFinalTranscriptAfterDeliveringPendingAudio()
+        } else {
+            activeTranscriptionSession?.requestFinalTranscript()
         }
-        finalizeFallbackWorkItem = fallbackWorkItem
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + finalTranscriptFallbackDelaySeconds,
-            execute: fallbackWorkItem
-        )
+
+        scheduleFinalTranscriptFallback(after: finalTranscriptFallbackDelaySeconds)
     }
 
-    private func startRecognitionSession() async throws {
-        activeTranscriptionSession?.cancel()
-        activeTranscriptionSession = nil
-
-        print("🎙️ BuddyDictationManager: opening transcription provider \(transcriptionProvider.displayName)")
-
-        let activeTranscriptionSession = try await transcriptionProvider.startStreamingSession(
-            keyterms: buildTranscriptionKeyterms(),
-            onTranscriptUpdate: { [weak self] transcriptText in
-                Task { @MainActor in
-                    self?.latestRecognizedText = transcriptText
-                }
-            },
-            onFinalTranscriptReady: { [weak self] transcriptText in
-                Task { @MainActor in
-                    guard let self else { return }
-                    self.latestRecognizedText = transcriptText
-
-                    if self.isFinalizingTranscript {
-                        self.finishCurrentDictationSessionIfNeeded(
-                            shouldSubmitFinalDraft: self.shouldAutomaticallySubmitFinalDraft
-                        )
-                    }
-                }
-            },
-            onError: { [weak self] error in
-                Task { @MainActor in
-                    self?.handleRecognitionError(error)
-                }
-            }
-        )
-
-        self.activeTranscriptionSession = activeTranscriptionSession
-        print("🎙️ BuddyDictationManager: provider ready, starting audio engine")
+    private func startRecognitionSession(startRequestIdentifier: UUID) async throws {
+        tearDownActiveRecognitionResources()
 
         // Apply the microphone pin BEFORE creating the fresh engine: the pin is
         // a session-scoped system-default-input switch (see the method's comment
@@ -856,9 +1025,10 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         // current system default input — which we may have just switched to the
         // pinned mic — and reports that device's real format for the tap.
         // Push-to-talk cadence is human-scale; engine construction is cheap.
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
         audioEngine = AVAudioEngine()
+
+        let earlyAudioBufferRelay = EarlyAudioBufferRelay()
+        activeEarlyAudioBufferRelay = earlyAudioBufferRelay
 
         let inputNode = audioEngine.inputNode
         let inputFormat = inputNode.outputFormat(forBus: 0)
@@ -867,13 +1037,196 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         // which device and format a session actually recorded from.
         print("🎙️ BuddyDictationManager: capturing from \(currentSessionCaptureDeviceDescription) at \(Int(inputFormat.sampleRate))Hz/\(inputFormat.channelCount)ch")
 
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
-            self?.activeTranscriptionSession?.appendAudioBuffer(buffer)
+        // The tap fires on AVFoundation's internal queue while the main actor
+        // may concurrently create or tear down the provider session. Capture
+        // the relay strongly rather than reading manager properties here: its
+        // lock makes startup buffering safe, its attached session stays alive
+        // for the tap's lifetime, and a stale tap can never feed a newer
+        // session. This preserves the use-after-free protection added after a
+        // field crash when headphones changed during recording.
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self, earlyAudioBufferRelay] buffer, _ in
+            earlyAudioBufferRelay.appendOrForward(buffer)
+
+            if buffer.frameLength > 0,
+               earlyAudioBufferRelay.markFirstNonEmptyAudioBufferDetectedIfNeeded() {
+                Task { @MainActor [weak self, earlyAudioBufferRelay] in
+                    self?.markMicrophoneLiveIfCurrentSession(
+                        startRequestIdentifier: startRequestIdentifier,
+                        earlyAudioBufferRelay: earlyAudioBufferRelay
+                    )
+                }
+            }
+
             self?.updateAudioPowerLevel(from: buffer)
         }
+        isInputTapInstalled = true
 
         audioEngine.prepare()
         try audioEngine.start()
+
+        print("🎙️ BuddyDictationManager: audio engine started, opening transcription provider \(transcriptionProvider.displayName)")
+
+        // This unstructured task deliberately survives cancellation of the
+        // shortcut-start task. A key release during provider setup must still
+        // produce a session so the already-buffered short utterance can be
+        // flushed and finalized.
+        transcriptionProviderStartupBeganAt = Date()
+        let transcriptionSessionCreationTask = Task<StreamingTranscriptionSessionTaskResult, Error> {
+            let transcriptionSession = try await transcriptionProvider.startStreamingSession(
+                keyterms: buildTranscriptionKeyterms(),
+                onTranscriptUpdate: { [weak self] transcriptText in
+                    Task { @MainActor in
+                        guard let self,
+                              self.activeEarlyAudioBufferRelay === earlyAudioBufferRelay else {
+                            return
+                        }
+
+                        self.latestRecognizedText = transcriptText
+                    }
+                },
+                onFinalTranscriptReady: { [weak self] transcriptText in
+                    Task { @MainActor in
+                        guard let self,
+                              self.activeEarlyAudioBufferRelay === earlyAudioBufferRelay else {
+                            return
+                        }
+
+                        self.latestRecognizedText = transcriptText
+
+                        if self.isFinalizingTranscript {
+                            self.finishCurrentDictationSessionIfNeeded(
+                                shouldSubmitFinalDraft: self.shouldAutomaticallySubmitFinalDraft
+                            )
+                        }
+                    }
+                },
+                onError: { [weak self] error in
+                    Task { @MainActor in
+                        guard let self,
+                              self.activeEarlyAudioBufferRelay === earlyAudioBufferRelay else {
+                            return
+                        }
+
+                        self.handleRecognitionError(error)
+                    }
+                }
+            )
+
+            return StreamingTranscriptionSessionTaskResult(
+                transcriptionSession: transcriptionSession
+            )
+        }
+        activeTranscriptionSessionCreationTask = transcriptionSessionCreationTask
+        let transcriptionSessionTaskResult = try await transcriptionSessionCreationTask.value
+        let newlyCreatedTranscriptionSession = transcriptionSessionTaskResult.transcriptionSession
+
+        guard activeEarlyAudioBufferRelay === earlyAudioBufferRelay else {
+            newlyCreatedTranscriptionSession.cancel()
+            earlyAudioBufferRelay.discard()
+            throw CancellationError()
+        }
+
+        activeTranscriptionSessionCreationTask = nil
+        transcriptionProviderStartupBeganAt = nil
+        activeTranscriptionSession = newlyCreatedTranscriptionSession
+        earlyAudioBufferRelay.attach(newlyCreatedTranscriptionSession)
+
+        // A quick press-and-release can reach finalization before provider
+        // setup completes. Flush first, then close the provider input so that
+        // the buffered utterance is included in its final transcript.
+        if isFinalizingTranscript {
+            earlyAudioBufferRelay.requestFinalTranscriptAfterDeliveringPendingAudio()
+            scheduleFinalTranscriptFallback(
+                after: newlyCreatedTranscriptionSession.finalTranscriptFallbackDelaySeconds
+            )
+        }
+
+        print("🎙️ BuddyDictationManager: transcription provider ready")
+    }
+
+    private func markMicrophoneLiveIfCurrentSession(
+        startRequestIdentifier: UUID,
+        earlyAudioBufferRelay: EarlyAudioBufferRelay
+    ) {
+        guard pendingStartRequestIdentifier == startRequestIdentifier,
+              activeEarlyAudioBufferRelay === earlyAudioBufferRelay,
+              let activeStartSource,
+              !isFinalizingTranscript else {
+            return
+        }
+
+        isRecordingFromMicrophoneButton = activeStartSource == .microphoneButton
+        isRecordingFromKeyboardShortcut = activeStartSource == .keyboardShortcut
+        isPreparingToRecord = false
+
+        if activeStartSource == .microphoneButton {
+            microphoneButtonRecordingStartedAt = Date()
+        }
+
+        Self.microphoneReadySound?.play()
+        print("🎙️ BuddyDictationManager: microphone is live")
+    }
+
+    private func scheduleFinalTranscriptFallback(after fallbackDelaySeconds: TimeInterval) {
+        finalizeFallbackWorkItem?.cancel()
+
+        // The work item fires on the main queue but does its real work in a
+        // separate MainActor Task hop. Provider attachment can re-arm this
+        // fallback inside that gap; without an identity check the stale,
+        // already-fired fallback would then see the freshly attached session,
+        // skip its re-arm branch, and finish the session before the final
+        // transcript arrives. Rotating this token on every (re-)arm lets the
+        // stale hop recognize it was superseded and bail out.
+        let fallbackRequestIdentifier = UUID()
+        currentFinalTranscriptFallbackRequestIdentifier = fallbackRequestIdentifier
+
+        let shouldSubmitFinalDraftWhenFallbackTriggers = shouldAutomaticallySubmitFinalDraft
+        let fallbackWorkItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                guard self.currentFinalTranscriptFallbackRequestIdentifier == fallbackRequestIdentifier else {
+                    return
+                }
+
+                // A key release can precede provider attachment. Keep the
+                // existing default fallback as a watchdog, but do not let it
+                // discard captured startup audio while provider creation is
+                // still legitimately in flight. Attachment re-arms this timer
+                // with the provider's own final-transcript delay.
+                if self.activeTranscriptionSession == nil,
+                   self.activeEarlyAudioBufferRelay != nil,
+                   self.isFinalizingTranscript {
+                    if let transcriptionProviderStartupBeganAt = self.transcriptionProviderStartupBeganAt {
+                        let providerStartupElapsedSeconds = Date().timeIntervalSince(
+                            transcriptionProviderStartupBeganAt
+                        )
+                        let providerStartupRemainingSeconds = Self.maximumTranscriptionProviderStartupWaitSeconds
+                            - providerStartupElapsedSeconds
+
+                        if providerStartupRemainingSeconds > 0 {
+                            self.scheduleFinalTranscriptFallback(
+                                after: min(
+                                    Self.defaultFinalTranscriptFallbackDelaySeconds,
+                                    providerStartupRemainingSeconds
+                                )
+                            )
+                            return
+                        }
+                    }
+
+                    print("⚠️ BuddyDictationManager: transcription provider did not become ready within 15 seconds after audio capture started")
+                }
+
+                self.finishCurrentDictationSessionIfNeeded(
+                    shouldSubmitFinalDraft: shouldSubmitFinalDraftWhenFallbackTriggers
+                )
+            }
+        }
+        finalizeFallbackWorkItem = fallbackWorkItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + fallbackDelaySeconds,
+            execute: fallbackWorkItem
+        )
     }
 
     private func handleRecognitionError(_ error: Error) {
@@ -912,9 +1265,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             currentDraftCallbacks?.updateDraftText(finalDraftText)
         }
 
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
-        activeTranscriptionSession?.cancel()
+        tearDownActiveRecognitionResources()
 
         resetSessionState()
 
@@ -931,6 +1282,26 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         guard !finalTranscriptText.isEmpty else { return }
 
         currentDraftCallbacks?.submitDraftText(finalDraftText)
+    }
+
+    private func stopAudioEngineAndRemoveInputTapIfInstalled() {
+        if isInputTapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            isInputTapInstalled = false
+        }
+
+        audioEngine.stop()
+    }
+
+    private func tearDownActiveRecognitionResources() {
+        stopAudioEngineAndRemoveInputTapIfInstalled()
+        activeTranscriptionSessionCreationTask?.cancel()
+        activeTranscriptionSessionCreationTask = nil
+        transcriptionProviderStartupBeganAt = nil
+        activeEarlyAudioBufferRelay?.discard()
+        activeEarlyAudioBufferRelay = nil
+        activeTranscriptionSession?.cancel()
+        activeTranscriptionSession = nil
     }
 
     private func composeDraftText(withTranscribedText transcribedText: String) -> String {
@@ -956,6 +1327,14 @@ final class BuddyDictationManager: NSObject, ObservableObject {
 
     private func resetSessionState() {
         pendingStartRequestIdentifier = UUID()
+        finalizeFallbackWorkItem?.cancel()
+        finalizeFallbackWorkItem = nil
+        // Also invalidate any fallback whose work item fired but whose
+        // MainActor hop has not run yet — it must not finish a session that
+        // starts after this reset.
+        currentFinalTranscriptFallbackRequestIdentifier = UUID()
+        activeEarlyAudioBufferRelay?.discard()
+        activeEarlyAudioBufferRelay = nil
         activeTranscriptionSession = nil
         draftCallbacks = nil
         activeStartSource = nil

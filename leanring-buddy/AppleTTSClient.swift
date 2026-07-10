@@ -102,19 +102,25 @@ private final class AppleSpeechStartDelegate: NSObject, AVSpeechSynthesizerDeleg
         self.completion = completion
     }
 
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
-        resumeOnce(with: .success(()))
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
+        Task { @MainActor in
+            self.resumeOnce(with: .success(()))
+        }
     }
 
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        resumeOnce(with: .failure(CancellationError()))
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        Task { @MainActor in
+            self.resumeOnce(with: .failure(CancellationError()))
+        }
     }
 
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
         // Degenerate utterances (for example an empty string) can finish
         // without ever reporting didStart — resume as success so the caller
         // is never stranded.
-        resumeOnce(with: .success(()))
+        Task { @MainActor in
+            self.resumeOnce(with: .success(()))
+        }
     }
 
     func forceCancel() {
