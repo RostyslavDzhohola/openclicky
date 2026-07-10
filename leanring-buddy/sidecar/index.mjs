@@ -69,6 +69,10 @@ let chatIdleResetTimer = null;
 const interviewTracker = createInterviewTracker();
 const INTERVIEW_IDLE_EXPIRY_MS = Number(process.env.CLICKY_INTERVIEW_IDLE_MS ?? 600_000);
 let interviewExpiryTimer = null;
+// Cancels that arrive between the chat turn and the interview turn hit no
+// in-flight backend turn; remember them so a cancelled setup never arms
+// interview routing (entries are dropped when their chat request finishes).
+const cancelledChatRequestIds = new Set();
 
 function armChatIdleReset() {
   clearTimeout(chatIdleResetTimer);
@@ -211,7 +215,11 @@ async function startInterview({ backend, model, effort, topicText, instructions,
       ? await runCodexChatTurn(interviewTurnArguments)
       : await runClaudeChatTurn(interviewTurnArguments);
 
-  return { workspace, replyText: turnResult.text };
+  return {
+    workspace,
+    replyText: turnResult.text,
+    lessonCountBeforeInterview: workspace.lessonCount,
+  };
 }
 
 function concludeInterviewIfMissionCaptured() {
@@ -222,7 +230,12 @@ function concludeInterviewIfMissionCaptured() {
   clearInterviewExpiryTimer();
   const completedInterview = interviewTracker.complete();
   emitLog("info", `mission captured for ${completedInterview.workspaceId} — concluding interview`);
-  if (describeWorkspace(completedInterview.workspaceId).lessonCount > 0) {
+  // Pre-feature topics may already own lessons without a mission — only a
+  // lesson the interview itself produced means the model jumped ahead.
+  if (
+    describeWorkspace(completedInterview.workspaceId).lessonCount >
+    completedInterview.lessonCountAtInterviewStart
+  ) {
     emitLog("info", "lesson already created during the interview — skipping build dispatch");
     return true;
   }
@@ -366,20 +379,28 @@ async function handleChatRequest(request) {
               onStatus,
             });
             if (interviewStart) {
-              const interviewReplyText = (interviewStart.replyText ?? "").trim();
-              responseText = [responseText, interviewReplyText]
-                .filter((part) => part.length > 0)
-                .join(" ");
-              interviewTracker.begin({
-                workspaceId: interviewStart.workspace.id,
-                backend: request.backend,
-                model: request.model,
-                topicText: dispatch.topicText,
-              });
-              // The model may capture the mission on the first turn if the
-              // tag's instructions already include enough user context.
-              if (!concludeInterviewIfMissionCaptured()) {
-                armInterviewExpiry();
+              if (cancelledChatRequestIds.has(request.id)) {
+                emitLog(
+                  "info",
+                  `interview start for ${interviewStart.workspace.id} was cancelled mid-setup — not arming interview routing`
+                );
+              } else {
+                const interviewReplyText = (interviewStart.replyText ?? "").trim();
+                responseText = [responseText, interviewReplyText]
+                  .filter((part) => part.length > 0)
+                  .join(" ");
+                interviewTracker.begin({
+                  workspaceId: interviewStart.workspace.id,
+                  backend: request.backend,
+                  model: request.model,
+                  topicText: dispatch.topicText,
+                  lessonCountAtInterviewStart: interviewStart.lessonCountBeforeInterview,
+                });
+                // The model may capture the mission on the first turn if the
+                // tag's instructions already include enough user context.
+                if (!concludeInterviewIfMissionCaptured()) {
+                  armInterviewExpiry();
+                }
               }
             }
           } catch (interviewError) {
@@ -407,6 +428,7 @@ async function handleChatRequest(request) {
       durationMs: turnResult.durationMs ?? null,
     });
   } finally {
+    cancelledChatRequestIds.delete(request.id);
     if (isChatPlaneTurn) {
       // A turn that fails or is cancelled still ends activity — the idle window must re-arm or ephemerality is lost.
       armChatIdleReset();
@@ -484,6 +506,9 @@ async function handleRequest(request) {
       const wasCancelled =
         (await cancelClaudeTurn(request.targetId)) ||
         (await cancelCodexTurn(request.targetId));
+      if (!wasCancelled && request.targetId) {
+        cancelledChatRequestIds.add(request.targetId);
+      }
       emitEvent({ id: request.id, type: "result", cancelled: wasCancelled });
       break;
     }
@@ -532,12 +557,18 @@ for (const pendingDispatch of pendingDispatches) {
     "info",
     `recovering pending teach dispatch → ${pendingDispatch.backend} topic=${pendingDispatch.topicText}`
   );
+  const recoveredTopicWorkspaceDirectory = workspacePath(slugifyTopicName(pendingDispatch.topicText));
   // Re-dispatching creates a fresh durable entry before any lesson work starts.
+  // A pre-feature durable entry can have no mission, and recovery has no chat
+  // turn available to relay an interview into.
   void dispatchTeachInstructions({
     backend: pendingDispatch.backend,
     model: pendingDispatch.model,
     topicText: pendingDispatch.topicText,
-    instructions: pendingDispatch.instructions,
+    instructions: missionFileExists(recoveredTopicWorkspaceDirectory)
+      ? pendingDispatch.instructions
+      : pendingDispatch.instructions +
+        "\n\nno one is available to answer questions in this session. if MISSION.md is missing, write a reasonable MISSION.md yourself from these instructions first, then build the lesson.",
   });
 }
 if (droppedStaleCount > 0) {

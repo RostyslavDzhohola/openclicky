@@ -27,6 +27,7 @@ test("begin creates an interview and replaces any previous interview", () => {
     backend: "claude",
     model: "sonnet",
     topicText: "First Topic",
+    lessonCountAtInterviewStart: 3,
   });
   const replacementInterview = interviewTracker.begin({
     workspaceId: "replacement-topic",
@@ -40,6 +41,7 @@ test("begin creates an interview and replaces any previous interview", () => {
     backend: "claude",
     model: "sonnet",
     topicText: "First Topic",
+    lessonCountAtInterviewStart: 3,
     turnCount: 0,
   });
   assert.deepEqual(replacementInterview, {
@@ -47,6 +49,7 @@ test("begin creates an interview and replaces any previous interview", () => {
     backend: "codex",
     model: "gpt-5",
     topicText: "Replacement Topic",
+    lessonCountAtInterviewStart: 0,
     turnCount: 0,
   });
   assert.equal(interviewTracker.activeInterview, replacementInterview);
