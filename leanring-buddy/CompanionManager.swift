@@ -347,18 +347,30 @@ final class CompanionManager: ObservableObject {
         return topicName
     }
 
-    /// Cleans up a lesson HTML file name for display: drops the leading `NNNN-`
-    /// ordering prefix and the `.html` suffix, then turns hyphens into spaces.
+    /// Cleans up a lesson HTML file name for display: drops the `.html` suffix,
+    /// turns the leading `NNNN-` ordering prefix into a spoken "Lesson N:" label
+    /// (so the menu shows the lesson's number, not just its title), and turns the
+    /// remaining hyphens into spaces.
     private static func lessonDisplayTitle(fromFileName lessonFileName: String) -> String {
         var title = lessonFileName
         if title.hasSuffix(".html") {
             title = String(title.dropLast(".html".count))
         }
-        // Strip a leading numeric ordering prefix like "0003-".
+
+        // Pull off a leading numeric ordering prefix like "0003-" and render it
+        // as "Lesson 3:". The stored number is zero-padded, so drop the padding
+        // for display. A file without the prefix just shows its cleaned title.
+        var lessonNumberLabel = ""
         if let prefixRange = title.range(of: #"^\d+-"#, options: .regularExpression) {
+            let numericPrefix = title[prefixRange].dropLast() // trailing "-"
+            if let lessonNumber = Int(numericPrefix) {
+                lessonNumberLabel = "Lesson \(lessonNumber): "
+            }
             title.removeSubrange(prefixRange)
         }
-        return title.replacingOccurrences(of: "-", with: " ")
+
+        let cleanedTitle = title.replacingOccurrences(of: "-", with: " ")
+        return lessonNumberLabel + cleanedTitle
     }
 
     private var selectedModelAlias: String {
