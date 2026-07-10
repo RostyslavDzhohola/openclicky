@@ -21,6 +21,8 @@ export const POST_INTERVIEW_BUILD_INSTRUCTIONS = `the mission interview is compl
 
 export const INTERVIEW_WRAP_UP_NOTE = `\n\n(system note: this mission interview has reached its turn limit — wrap up now. write MISSION.md with what you already know and stop asking questions.)`;
 
+export const BUILD_HANDOFF_SPOKEN_NOTE = ` your first lesson is on its way — it takes a few minutes and will open on its own, so feel free to do something else.`;
+
 /** True when the teach skill has already captured the topic's mission. */
 export function missionFileExists(workspaceDirectoryPath) {
   return existsSync(join(workspaceDirectoryPath, "MISSION.md"));

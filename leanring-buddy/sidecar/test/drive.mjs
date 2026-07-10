@@ -389,6 +389,12 @@ async function runSplitDrive() {
     600_000
   );
   console.log(`[drive] lesson created: ${lessonEvent.path}`);
+  assertCondition(
+    sidecar.allEvents.some(
+      (event) => event.type === "teachBuildStarted" && event.workspaceId === "drive-split-topic"
+    ),
+    "no teachBuildStarted event for the split dispatch"
+  );
 
   // 3. Dashboard exists and links the new lesson.
   const dashboardHtml = readFileSync(join(sidecar.lessonsRoot, "index.html"), "utf8");
@@ -480,6 +486,16 @@ async function runInterviewDrive() {
     typeof confirmationChatCompletion.text === "string" && confirmationChatCompletion.text.trim().length > 0,
     "confirmation chat returned empty text"
   );
+  assertCondition(
+    sidecar.allEvents.some(
+      (event) =>
+        event.type === "speak" &&
+        event.id === confirmationChatRequestId &&
+        typeof event.text === "string" &&
+        event.text.trim().length > 0
+    ),
+    "no speak event carried the setup ack"
+  );
   assertCondition(!confirmationChatCompletion.text.includes("[TEACH"), "confirmation chat leaked a TEACH tag");
   assertCondition(!sidecar.hasLogEventContaining("teach dispatch →"), "lesson build dispatched during interview start");
 
@@ -523,6 +539,20 @@ async function runInterviewDrive() {
   if (!sidecar.hasLogEventContaining("teach dispatch →")) {
     await sidecar.waitFor(
       (event) => event.type === "log" && String(event.message ?? "").includes("teach dispatch →"),
+      60_000
+    );
+  }
+  if (
+    !sidecar.allEvents.some(
+      (event) =>
+        event.type === "teachBuildStarted" &&
+        event.workspaceId === basename(topicWorkspaceDirectory)
+    )
+  ) {
+    await sidecar.waitFor(
+      (event) =>
+        event.type === "teachBuildStarted" &&
+        event.workspaceId === basename(topicWorkspaceDirectory),
       60_000
     );
   }

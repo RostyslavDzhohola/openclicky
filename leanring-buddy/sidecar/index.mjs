@@ -34,6 +34,7 @@ const {
   LESSON_GROUNDING_NOTE,
   POST_INTERVIEW_BUILD_INSTRUCTIONS,
   INTERVIEW_WRAP_UP_NOTE,
+  BUILD_HANDOFF_SPOKEN_NOTE,
   missionFileExists,
   createInterviewTracker,
 } = await import("./src/teachInterview.mjs");
@@ -172,6 +173,7 @@ async function dispatchTeachInstructions({ backend, model, topicText, instructio
       "info",
       `teach dispatch → ${backend} model=${model ?? "default"} effort=${lessonEffortLevel} workspace=${workspace.id} instructions="${String(instructions).slice(0, 300).replace(/\r?\n/g, " ")}"`
     );
+    emitEvent({ type: "teachBuildStarted", workspaceId: workspace.id, topicName: topicText });
     let turnResult;
     if (backend === "codex") {
       turnResult = await runCodexChatTurn(dispatchArguments);
@@ -224,8 +226,10 @@ async function startInterview({ backend, model, effort, topicText, instructions,
 
 function concludeInterviewIfMissionCaptured() {
   const activeInterview = interviewTracker.activeInterview;
-  if (!activeInterview) return false;
-  if (!missionFileExists(workspacePath(activeInterview.workspaceId))) return false;
+  if (!activeInterview) return { missionCaptured: false, buildDispatched: false };
+  if (!missionFileExists(workspacePath(activeInterview.workspaceId))) {
+    return { missionCaptured: false, buildDispatched: false };
+  }
 
   clearInterviewExpiryTimer();
   const completedInterview = interviewTracker.complete();
@@ -237,7 +241,7 @@ function concludeInterviewIfMissionCaptured() {
     completedInterview.lessonCountAtInterviewStart
   ) {
     emitLog("info", "lesson already created during the interview — skipping build dispatch");
-    return true;
+    return { missionCaptured: true, buildDispatched: false };
   }
 
   void dispatchTeachInstructions({
@@ -246,7 +250,7 @@ function concludeInterviewIfMissionCaptured() {
     topicText: completedInterview.topicText,
     instructions: POST_INTERVIEW_BUILD_INSTRUCTIONS,
   });
-  return true;
+  return { missionCaptured: true, buildDispatched: true };
 }
 
 async function handleChatRequest(request) {
@@ -294,13 +298,20 @@ async function handleChatRequest(request) {
         emitLog("warn", `ignoring leaked teach tag from interview workspace ${activeInterview.workspaceId}`);
       }
 
-      if (!concludeInterviewIfMissionCaptured()) {
+      const interviewConclusion = concludeInterviewIfMissionCaptured();
+      if (!interviewConclusion.missionCaptured) {
         armInterviewExpiry();
+      }
+      let spokenReplyText = cleanedText;
+      if (interviewConclusion.buildDispatched) {
+        // The teach session's own wrap-up ("your course is set up") says nothing
+        // about the multi-minute build that follows — set that expectation now.
+        spokenReplyText = spokenReplyText + BUILD_HANDOFF_SPOKEN_NOTE;
       }
       emitEvent({
         id: request.id,
         type: "result",
-        text: cleanedText,
+        text: spokenReplyText,
         sessionId: turnResult.sessionId ?? null,
         durationMs: turnResult.durationMs ?? null,
       });
@@ -369,6 +380,12 @@ async function handleChatRequest(request) {
         } else {
           // No mission yet: run the teach skill's own mission interview over voice.
           try {
+            // The sync interview turn takes tens of seconds; speak the chat ack now so
+            // the user is not left in silence until the first interview question.
+            if (responseText.trim().length > 0) {
+              emitEvent({ id: request.id, type: "speak", text: responseText });
+              responseText = "";
+            }
             const interviewStart = await startInterview({
               backend: request.backend,
               model: request.model,
@@ -398,8 +415,14 @@ async function handleChatRequest(request) {
                 });
                 // The model may capture the mission on the first turn if the
                 // tag's instructions already include enough user context.
-                if (!concludeInterviewIfMissionCaptured()) {
+                const interviewConclusion = concludeInterviewIfMissionCaptured();
+                if (!interviewConclusion.missionCaptured) {
                   armInterviewExpiry();
+                }
+                if (interviewConclusion.buildDispatched) {
+                  // The teach session's own wrap-up ("your course is set up") says nothing
+                  // about the multi-minute build that follows — set that expectation now.
+                  responseText = responseText + BUILD_HANDOFF_SPOKEN_NOTE;
                 }
               }
             }

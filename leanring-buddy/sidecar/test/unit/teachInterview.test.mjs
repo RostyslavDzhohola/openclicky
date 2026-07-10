@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  BUILD_HANDOFF_SPOKEN_NOTE,
   INTERVIEW_PREAMBLE,
   INTERVIEW_TURN_CAP,
   INTERVIEW_WRAP_UP_NOTE,
@@ -140,4 +141,9 @@ test("interview constants are populated with the required mission guidance", () 
   assert.match(INTERVIEW_PREAMBLE, /MISSION\.md/);
   assert.match(POST_INTERVIEW_BUILD_INSTRUCTIONS, /MISSION\.md/);
   assert.equal(INTERVIEW_TURN_CAP, 8);
+});
+
+test("build handoff spoken note is populated and preserves its leading space", () => {
+  assert.notEqual(BUILD_HANDOFF_SPOKEN_NOTE, "");
+  assert.equal(BUILD_HANDOFF_SPOKEN_NOTE.startsWith(" "), true);
 });
