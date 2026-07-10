@@ -15,6 +15,7 @@
     "drive:oneshot": "node test/drive.mjs oneshot",
     "drive:teach": "node test/drive.mjs teach",
     "drive:compare": "node test/compare.mjs",
+    "drive:interview": "node test/drive.mjs interview",
     "drive:auth": "node test/drive.mjs auth",
     "drive:resume": "node test/drive.mjs resume",
     "drive:split": "node test/drive.mjs split",

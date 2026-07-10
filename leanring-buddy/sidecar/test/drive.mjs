@@ -12,14 +12,15 @@
 //   node test/drive.mjs workspaces
 //   node test/drive.mjs resume [--backend ...]   (two sidecar processes, proves continuity)
 //   node test/drive.mjs split  [--backend ...]   (chat dispatch + background lesson creation)
+//   node test/drive.mjs interview [--backend ...] (topic interview + lesson build)
 //
 // By default all state goes to throwaway dirs under $TMPDIR (clicky-drive-*).
 // Pass --real to use the real ~/Documents/OpenClicky Lessons + Application Support.
 
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import { chatModelForBackend } from "./chatModelForBackend.mjs";
@@ -63,6 +64,7 @@ class SidecarProcess {
       stdio: ["pipe", "pipe", "inherit"],
     });
     this.eventWaiters = [];
+    this.allEvents = [];
     this.intentionallyStopped = false;
     this.exited = new Promise((resolveExit) => {
       this.child.once("exit", resolveExit);
@@ -89,6 +91,7 @@ class SidecarProcess {
         return;
       }
       console.log(`[event] ${JSON.stringify(event)}`);
+      this.allEvents.push(event);
       for (const waiter of [...this.eventWaiters]) {
         if (waiter.predicate(event)) {
           this.eventWaiters.splice(this.eventWaiters.indexOf(waiter), 1);
@@ -117,6 +120,12 @@ class SidecarProcess {
         },
       });
     });
+  }
+
+  hasLogEventContaining(substring) {
+    return this.allEvents.some(
+      (event) => event.type === "log" && String(event.message ?? "").includes(substring)
+    );
   }
 
   /** Resolves with the result/error event matching the request id. */
@@ -344,6 +353,14 @@ async function runSplitDrive() {
     "unexpected workspace id: " + (createCompletion.workspace?.id ?? "none")
   );
 
+  // Since interview mode shipped, a mission-less topic would route this
+  // drive's forced tag into a voice interview. This scenario tests the
+  // immediate-dispatch path, so satisfy the mission check up front.
+  writeFileSync(
+    join(sidecar.lessonsRoot, "drive-split-topic", "MISSION.md"),
+    "# mission\nstub mission so the split drive exercises the immediate dispatch path\n"
+  );
+
   // 1. Chat-plane turn instructed to emit the extended tag verbatim, so the
   //    routing is tested without depending on the model's own intent detection.
   //    The topic must pre-exist because companion rules forbid tagging
@@ -419,6 +436,105 @@ async function runSplitDrive() {
   await sidecar.stop();
 }
 
+async function runInterviewDrive() {
+  // The sandbox default of 3 seconds would reset the ephemeral chat session
+  // between interview turns and break tag-confirmation context.
+  driveEnvironment.CLICKY_CHAT_IDLE_MS = "120000";
+
+  const sidecar = await startSidecar();
+
+  const initialChatRequestId = newRequestId();
+  sidecar.send({
+    id: initialChatRequestId,
+    type: "chat",
+    backend,
+    model: chatModelForBackend(backend),
+    effort: "low",
+    text: "teach me celestial navigation",
+    images: [],
+  });
+  const initialChatCompletion = await sidecar.waitForCompletion(initialChatRequestId, 300_000);
+  assertCondition(initialChatCompletion.type === "result", `initial chat failed: ${initialChatCompletion.message}`);
+  assertCondition(
+    typeof initialChatCompletion.text === "string" && initialChatCompletion.text.trim().length > 0,
+    "initial chat returned empty text"
+  );
+  assertCondition(!initialChatCompletion.text.includes("[TEACH"), "initial chat leaked a TEACH tag");
+  // This asserts model behavior, so it is probabilistic by design, like the rest of the drive.
+  assertCondition(initialChatCompletion.text.includes("?"), "ask-before-create did not ask a question");
+  assertCondition(!sidecar.hasLogEventContaining("teach dispatch →"), "lesson build dispatched before confirmation");
+
+  const confirmationChatRequestId = newRequestId();
+  sidecar.send({
+    id: confirmationChatRequestId,
+    type: "chat",
+    backend,
+    model: chatModelForBackend(backend),
+    effort: "low",
+    text: "yes, start the course",
+    images: [],
+  });
+  const confirmationChatCompletion = await sidecar.waitForCompletion(confirmationChatRequestId, 600_000);
+  assertCondition(confirmationChatCompletion.type === "result", `confirmation chat failed: ${confirmationChatCompletion.message}`);
+  assertCondition(
+    typeof confirmationChatCompletion.text === "string" && confirmationChatCompletion.text.trim().length > 0,
+    "confirmation chat returned empty text"
+  );
+  assertCondition(!confirmationChatCompletion.text.includes("[TEACH"), "confirmation chat leaked a TEACH tag");
+  assertCondition(!sidecar.hasLogEventContaining("teach dispatch →"), "lesson build dispatched during interview start");
+
+  const matchingTopicWorkspaceDirectories = readdirSync(sidecar.lessonsRoot, { withFileTypes: true })
+    .filter((directoryEntry) => directoryEntry.isDirectory() && !directoryEntry.name.startsWith(".") && directoryEntry.name.includes("celestial"))
+    .map((directoryEntry) => directoryEntry.name);
+  // The chat agent picks the slug, so match loosely.
+  assertCondition(matchingTopicWorkspaceDirectories.length === 1, "expected exactly one celestial topic workspace");
+  const topicWorkspaceDirectory = join(sidecar.lessonsRoot, matchingTopicWorkspaceDirectories[0]);
+
+  const scriptedInterviewAnswers = [
+    "i want to sail across the atlantic without gps. i am a complete beginner.",
+    "success means i can plot a position fix with a sextant on a real ocean passage.",
+    "no other constraints. you have everything you need — write the mission now.",
+    "nothing else to add. please write MISSION.md now.",
+  ];
+
+  for (const scriptedInterviewAnswer of scriptedInterviewAnswers) {
+    const interviewAnswerRequestId = newRequestId();
+    sidecar.send({
+      id: interviewAnswerRequestId,
+      type: "chat",
+      backend,
+      model: chatModelForBackend(backend),
+      effort: "low",
+      text: scriptedInterviewAnswer,
+      images: [],
+    });
+    const interviewAnswerCompletion = await sidecar.waitForCompletion(interviewAnswerRequestId, 600_000);
+    assertCondition(interviewAnswerCompletion.type === "result", `interview answer failed: ${interviewAnswerCompletion.message}`);
+    if (existsSync(join(topicWorkspaceDirectory, "MISSION.md"))) {
+      break;
+    }
+  }
+  assertCondition(existsSync(join(topicWorkspaceDirectory, "MISSION.md")), "interview never produced MISSION.md");
+
+  const missionFileContents = readFileSync(join(topicWorkspaceDirectory, "MISSION.md"), "utf8");
+  assertCondition(missionFileContents.length > 0, "MISSION.md is empty");
+  assertCondition(/(atlantic|gps|sextant|navigat)/i.test(missionFileContents), "MISSION.md did not capture interview answers");
+
+  if (!sidecar.hasLogEventContaining("teach dispatch →")) {
+    await sidecar.waitFor(
+      (event) => event.type === "log" && String(event.message ?? "").includes("teach dispatch →"),
+      60_000
+    );
+  }
+  await sidecar.waitFor(
+    (event) => event.type === "lessonCreated" && event.workspaceId === basename(topicWorkspaceDirectory),
+    600_000
+  );
+
+  console.log("\n[PASS] interview ran, mission captured, lesson built");
+  await sidecar.stop();
+}
+
 const driveSubcommands = {
   chat: runChatDrive,
   oneshot: runOneShotDrive,
@@ -427,6 +543,7 @@ const driveSubcommands = {
   teach: runTeachDrive,
   resume: runResumeDrive,
   split: runSplitDrive,
+  interview: runInterviewDrive,
 };
 
 const selectedDrive = driveSubcommands[subcommand];
