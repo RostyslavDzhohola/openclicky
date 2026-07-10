@@ -283,7 +283,13 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     }
 
     private let transcriptionProvider: any BuddyTranscriptionProvider
-    private let audioEngine = AVAudioEngine()
+    /// Replaced with a fresh instance at every session start (see
+    /// `startRecognitionSession`): a built engine caches its input node's format
+    /// from the device it was constructed around, so re-pointing the AUHAL on a
+    /// cached engine reports the OLD device's format and the tap captures
+    /// silence. A fresh engine is also what makes an unpinned session follow the
+    /// system default input naturally.
+    private var audioEngine = AVAudioEngine()
     private var activeTranscriptionSession: (any BuddyStreamingTranscriptionSession)?
     private var activeStartSource: BuddyDictationStartSource?
     private var draftCallbacks: BuddyDictationDraftCallbacks?
@@ -299,15 +305,6 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     /// Timestamp of the last completed permission request, used to debounce
     /// rapid follow-up requests that arrive before macOS updates its cache.
     private var lastPermissionRequestCompletedAt: Date?
-    /// The device we last explicitly set on the input node's AUHAL this app run
-    /// (a user pin, or the default input re-applied after a pin was cleared).
-    /// The engine is cached for the app's lifetime, so any explicit device set
-    /// outlives the session that made it AND permanently disables the AUHAL's
-    /// automatic default-follow. While this is non-nil, every nil-preference
-    /// session start re-resolves and re-applies the current system default to
-    /// emulate default-follow per session; it stays nil only while the AUHAL has
-    /// never been touched and still follows the default on its own.
-    private var lastAppliedMicrophoneOverrideDeviceID: AudioDeviceID?
 
     override init() {
         let transcriptionProvider = BuddyTranscriptionProviderFactory.makeDefaultProvider()
@@ -386,30 +383,6 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         return resolvedDeviceID
     }
 
-    /// Reads the system's current default input device from CoreAudio, or `nil`
-    /// on failure. Used to actively restore default routing after a previously
-    /// applied override is cleared — we cannot just "not set" the device because
-    /// the cached engine's AUHAL keeps whatever device was last pinned.
-    private func systemDefaultInputDeviceID() -> AudioDeviceID? {
-        var defaultInputAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultInputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var defaultInputDeviceID = AudioDeviceID(kAudioObjectUnknown)
-        var defaultInputDeviceIDSize = UInt32(MemoryLayout<AudioDeviceID>.size)
-        let readStatus = AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject),
-            &defaultInputAddress,
-            0,
-            nil,
-            &defaultInputDeviceIDSize,
-            &defaultInputDeviceID
-        )
-        guard readStatus == noErr, defaultInputDeviceID != kAudioObjectUnknown else { return nil }
-        return defaultInputDeviceID
-    }
-
     /// Sets a specific device on the input node's AUHAL. Returns whether the
     /// property write succeeded.
     private func setInputNodeCaptureDevice(_ captureDeviceID: AudioDeviceID) -> Bool {
@@ -430,60 +403,27 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         return setDeviceStatus == noErr
     }
 
-    /// Applies the user's pinned-microphone preference to the shared audio
-    /// engine's input node BEFORE the tap format is read, so the tap picks up the
-    /// chosen device's native format. Re-applied at every session start so a
-    /// changed selection (or a device that came back) takes effect on the next
-    /// push-to-talk without an app restart.
+    /// Applies the user's pinned-microphone preference to the current (freshly
+    /// created) engine's input node BEFORE the tap format is read, so the tap
+    /// picks up the chosen device's native format.
     ///
-    /// When no preference is set (or the pinned mic can no longer be resolved)
-    /// AND we previously pinned a device this app run, we must actively re-point
-    /// the AUHAL at the current system default input: the engine is cached, so
-    /// the old pin would otherwise persist — reverting to "System default" would
-    /// silently keep the previous device, and an unplugged pinned mic would
-    /// strand the AUHAL on a dead AudioDeviceID. When no override was ever
-    /// applied we deliberately set nothing, so the AUHAL keeps following the
-    /// system default automatically (pinning the current default's fixed id
-    /// would disable that follow behaviour).
+    /// When no preference is set — or the pinned mic can no longer be resolved
+    /// (unplugged) — this deliberately does nothing: each session runs on a
+    /// brand-new engine whose AUHAL starts out following the system default
+    /// input, so "no pin" needs no restore machinery. The per-session fresh
+    /// engine IS the default-follow mechanism.
     private func applyPreferredMicrophoneOverrideToInputNode() {
-        let preferredMicrophoneUID = preferredMicrophoneUID()
-        let resolvedPreferredDeviceID: AudioDeviceID?
-        if let preferredMicrophoneUID, !preferredMicrophoneUID.isEmpty {
-            resolvedPreferredDeviceID = audioDeviceID(forUID: preferredMicrophoneUID)
-            if resolvedPreferredDeviceID == nil {
-                print("⚠️ BuddyDictationManager: preferred microphone \(preferredMicrophoneUID) is unavailable; using system default input")
-            }
-        } else {
-            resolvedPreferredDeviceID = nil
-        }
-
-        guard let preferredDeviceID = resolvedPreferredDeviceID else {
-            // No usable preference. Restore default routing only if we ever set
-            // a device on the AUHAL this app run; otherwise leave it untouched so
-            // it keeps auto-following the system default.
-            //
-            // The tracker intentionally STAYS set after a successful restore:
-            // explicitly setting any device (even the default's id) disables the
-            // AUHAL's automatic default-follow permanently for the cached engine,
-            // so we emulate that follow behaviour per session — every subsequent
-            // nil-preference session re-resolves and re-applies the CURRENT
-            // default input here. Clearing the tracker would freeze capture on a
-            // snapshot of one moment's default device.
-            if lastAppliedMicrophoneOverrideDeviceID != nil {
-                if let defaultInputDeviceID = systemDefaultInputDeviceID(),
-                   setInputNodeCaptureDevice(defaultInputDeviceID) {
-                    lastAppliedMicrophoneOverrideDeviceID = defaultInputDeviceID
-                } else {
-                    print("⚠️ BuddyDictationManager: failed to restore the system default input after clearing the microphone pin")
-                }
-            }
+        guard let preferredMicrophoneUID = preferredMicrophoneUID(), !preferredMicrophoneUID.isEmpty else {
             return
         }
 
-        if setInputNodeCaptureDevice(preferredDeviceID) {
-            lastAppliedMicrophoneOverrideDeviceID = preferredDeviceID
-        } else {
-            print("⚠️ BuddyDictationManager: failed to pin microphone \(preferredMicrophoneUID ?? "?") (device \(preferredDeviceID)); using system default input")
+        guard let preferredDeviceID = audioDeviceID(forUID: preferredMicrophoneUID) else {
+            print("⚠️ BuddyDictationManager: preferred microphone \(preferredMicrophoneUID) is unavailable; using system default input")
+            return
+        }
+
+        if !setInputNodeCaptureDevice(preferredDeviceID) {
+            print("⚠️ BuddyDictationManager: failed to pin microphone \(preferredMicrophoneUID) (device \(preferredDeviceID)); using system default input")
         }
     }
 
@@ -741,6 +681,19 @@ final class BuddyDictationManager: NSObject, ObservableObject {
 
         self.activeTranscriptionSession = activeTranscriptionSession
         print("🎙️ BuddyDictationManager: provider ready, starting audio engine")
+
+        // Rebuild the engine from scratch for every dictation session. An
+        // already-built engine caches its input node's format from the device it
+        // was constructed around, so re-pointing the AUHAL at a pinned mic on a
+        // cached engine leaves `outputFormat(forBus:)` reporting the OLD device's
+        // format — the tap then mismatches the render chain and captures silence
+        // (e.g. Bluetooth headphones as default at HFP 16kHz with a 48kHz USB mic
+        // pinned). Only a fresh engine reliably reports the pinned device's real
+        // format, and it naturally follows the system default when no pin is
+        // set. Push-to-talk cadence is human-scale; engine construction is cheap.
+        audioEngine.stop()
+        audioEngine.inputNode.removeTap(onBus: 0)
+        audioEngine = AVAudioEngine()
 
         let inputNode = audioEngine.inputNode
         // Pin the user's chosen microphone (if any) BEFORE reading the tap
