@@ -1,17 +1,29 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { createLessonEventCoordinator } from "../../src/lessonWatcher.mjs";
+import {
+  createLessonEventCoordinator,
+  didAgentOpenLesson,
+} from "../../src/lessonWatcher.mjs";
 
 function createCoordinatorHarness({ gracePeriodMs = 15, holdSafetyTimeoutMs = 50 } = {}) {
-  let shellCommands = [];
+  let lastBackendForWorkspace = "claude";
+  const shellCommandsByBackend = new Map([
+    ["claude", []],
+    ["codex", []],
+  ]);
+  const requestedShellCommandBackends = [];
   const emittedLessonEvents = [];
   const logs = [];
   let dashboardRegenerationCount = 0;
   const coordinator = createLessonEventCoordinator({
     gracePeriodMs,
     holdSafetyTimeoutMs,
-    getShellCommandsForWorkspace: () => shellCommands,
+    getShellCommandsForWorkspace: (workspaceId, heldLessonBackend) => {
+      const commandBackend = heldLessonBackend ?? lastBackendForWorkspace;
+      requestedShellCommandBackends.push(commandBackend);
+      return shellCommandsByBackend.get(commandBackend) ?? [];
+    },
     regenerateDashboard: () => {
       dashboardRegenerationCount += 1;
     },
@@ -27,11 +39,15 @@ function createCoordinatorHarness({ gracePeriodMs = 15, holdSafetyTimeoutMs = 50
     coordinator,
     emittedLessonEvents,
     logs,
+    requestedShellCommandBackends,
     get dashboardRegenerationCount() {
       return dashboardRegenerationCount;
     },
-    setShellCommands(commands) {
-      shellCommands = commands;
+    setLastBackendForWorkspace(backend) {
+      lastBackendForWorkspace = backend;
+    },
+    setShellCommands(commands, backend = lastBackendForWorkspace) {
+      shellCommandsByBackend.set(backend, commands);
     },
   };
 }
@@ -39,6 +55,35 @@ function createCoordinatorHarness({ gracePeriodMs = 15, holdSafetyTimeoutMs = 50
 function waitForTimer(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
+
+test("didAgentOpenLesson requires open to be the shell segment command", () => {
+  assert.equal(
+    didAgentOpenLesson(["open lessons/0001-x.html"], "0001-x.html"),
+    true
+  );
+  assert.equal(
+    didAgentOpenLesson(["cd foo && open \"lessons/0002-y.html\""], "0002-y.html"),
+    true
+  );
+  assert.equal(
+    didAgentOpenLesson(
+      ["CLICKY_SOURCE=agent open lessons/0002-y.html"],
+      "0002-y.html"
+    ),
+    true
+  );
+  assert.equal(
+    didAgentOpenLesson(
+      ["echo hi > lessons/0001-open-source.html"],
+      "0001-open-source.html"
+    ),
+    false
+  );
+  assert.equal(
+    didAgentOpenLesson(["reopen lessons/0003-z.html"], "0003-z.html"),
+    false
+  );
+});
 
 test("unheld lesson additions use commands available when the grace period ends", async () => {
   const harness = createCoordinatorHarness();
@@ -64,7 +109,7 @@ test("unheld lesson additions use commands available when the grace period ends"
 
 test("held lessons use commands recorded after the add and before the turn flushes", () => {
   const harness = createCoordinatorHarness();
-  harness.coordinator.beginTeachTurnHold("css", {
+  harness.coordinator.beginTeachTurnHold("css", "claude", {
     traceId: "trace-1",
     parentTurnId: "turn-1",
     dispatchId: "dispatch-1",
@@ -85,9 +130,30 @@ test("held lessons use commands recorded after the add and before the turn flush
   assert.match(harness.logs[0].message, /held=true/);
 });
 
+test("held lessons use the backend captured when the hold began", () => {
+  const harness = createCoordinatorHarness();
+  harness.setShellCommands(
+    ["open /lessons/css/lessons/0001-selectors.html"],
+    "claude"
+  );
+  harness.setShellCommands([], "codex");
+  harness.setLastBackendForWorkspace("claude");
+  harness.coordinator.beginTeachTurnHold("css", "claude");
+  harness.coordinator.handleStabilizedLessonAdd({
+    workspaceId: "css",
+    addedFilePath: "/lessons/css/lessons/0001-selectors.html",
+  });
+
+  harness.setLastBackendForWorkspace("codex");
+  harness.coordinator.endTeachTurnHold("css");
+
+  assert.equal(harness.emittedLessonEvents[0].openedByAgent, true);
+  assert.deepEqual(harness.requestedShellCommandBackends, ["claude"]);
+});
+
 test("held lessons flush as unopened when the turn did not open them", () => {
   const harness = createCoordinatorHarness();
-  harness.coordinator.beginTeachTurnHold("css");
+  harness.coordinator.beginTeachTurnHold("css", "claude");
   harness.coordinator.handleStabilizedLessonAdd({
     workspaceId: "css",
     addedFilePath: "/lessons/css/lessons/0001-selectors.html",
@@ -101,8 +167,8 @@ test("held lessons flush as unopened when the turn did not open them", () => {
 
 test("overlapping teach holds do not flush until every holder ends", () => {
   const harness = createCoordinatorHarness();
-  harness.coordinator.beginTeachTurnHold("css");
-  harness.coordinator.beginTeachTurnHold("css");
+  harness.coordinator.beginTeachTurnHold("css", "claude");
+  harness.coordinator.beginTeachTurnHold("css", "claude");
   harness.coordinator.handleStabilizedLessonAdd({
     workspaceId: "css",
     addedFilePath: "/lessons/css/lessons/0001-selectors.html",
@@ -117,7 +183,7 @@ test("overlapping teach holds do not flush until every holder ends", () => {
 
 test("a stranded teach hold safety-flushes queued lessons", async () => {
   const harness = createCoordinatorHarness({ holdSafetyTimeoutMs: 15 });
-  harness.coordinator.beginTeachTurnHold("css");
+  harness.coordinator.beginTeachTurnHold("css", "claude");
   harness.coordinator.handleStabilizedLessonAdd({
     workspaceId: "css",
     addedFilePath: "/lessons/css/lessons/0001-selectors.html",
@@ -132,7 +198,7 @@ test("a stranded teach hold safety-flushes queued lessons", async () => {
 
 test("one hold flushes multiple queued lessons in discovery order", () => {
   const harness = createCoordinatorHarness();
-  harness.coordinator.beginTeachTurnHold("css");
+  harness.coordinator.beginTeachTurnHold("css", "claude");
   harness.coordinator.handleStabilizedLessonAdd({
     workspaceId: "css",
     addedFilePath: "/lessons/css/lessons/0001-selectors.html",
@@ -160,7 +226,7 @@ test("one hold flushes multiple queued lessons in discovery order", () => {
 
 test("discarding a sole hold drops queued lessons without emitting them", () => {
   const harness = createCoordinatorHarness();
-  harness.coordinator.beginTeachTurnHold("css");
+  harness.coordinator.beginTeachTurnHold("css", "claude");
   harness.coordinator.handleStabilizedLessonAdd({
     workspaceId: "css",
     addedFilePath: "/lessons/css/lessons/0001-selectors.html",
@@ -180,8 +246,8 @@ test("discarding a sole hold drops queued lessons without emitting them", () => 
 
 test("a discard request on one nested hold prevents the final hold from flushing", () => {
   const harness = createCoordinatorHarness();
-  harness.coordinator.beginTeachTurnHold("css");
-  harness.coordinator.beginTeachTurnHold("css");
+  harness.coordinator.beginTeachTurnHold("css", "claude");
+  harness.coordinator.beginTeachTurnHold("css", "claude");
   harness.coordinator.handleStabilizedLessonAdd({
     workspaceId: "css",
     addedFilePath: "/lessons/css/lessons/0001-selectors.html",
@@ -196,8 +262,8 @@ test("a discard request on one nested hold prevents the final hold from flushing
 
 test("a marked nested hold discards queued lessons at the safety timeout", async () => {
   const harness = createCoordinatorHarness({ holdSafetyTimeoutMs: 15 });
-  harness.coordinator.beginTeachTurnHold("css");
-  harness.coordinator.beginTeachTurnHold("css");
+  harness.coordinator.beginTeachTurnHold("css", "claude");
+  harness.coordinator.beginTeachTurnHold("css", "claude");
   harness.coordinator.handleStabilizedLessonAdd({
     workspaceId: "css",
     addedFilePath: "/lessons/css/lessons/0001-selectors.html",
@@ -218,7 +284,7 @@ test("a marked nested hold discards queued lessons at the safety timeout", async
 
 test("ending a hold without discard keeps the default flush behavior", () => {
   const harness = createCoordinatorHarness();
-  harness.coordinator.beginTeachTurnHold("css");
+  harness.coordinator.beginTeachTurnHold("css", "claude");
   harness.coordinator.handleStabilizedLessonAdd({
     workspaceId: "css",
     addedFilePath: "/lessons/css/lessons/0001-selectors.html",

@@ -134,9 +134,11 @@ Relevant semantics:
 A faithful *implementation pattern* for Theo's idea—not a verbatim command from Theo—would be:
 
 ```bash
-claude -p --model opus \
+claude --bare -p --model opus --permission-mode plan \
   "Review the API design in the current changes. Identify contract mistakes, unnecessary complexity, missing edge cases, and compatibility risks. Return concise, actionable feedback. Do not edit files."
 ```
+
+`--permission-mode plan` makes the review read-only by construction instead of by prompt instruction alone, and `--bare` keeps it from inheriting project hooks, plugins, and MCP servers (see the trade-off below).
 
 If a deterministic script is desired, Anthropic now recommends considering `--bare` and explicitly passing required context and tools. That recommendation post-dates the original workflow and changes behavior because `--bare` skips `CLAUDE.md`, skills, plugins, hooks, MCP servers, and auto-memory.
 

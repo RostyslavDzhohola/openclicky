@@ -76,6 +76,10 @@ const {
 const { clearPendingDispatch, recordPendingDispatch, takePendingDispatches } = await import(
   "./src/teachDispatchQueue.mjs"
 );
+const {
+  buildLessonCompletionAnnouncement,
+  lessonFileNamesCreatedDuringDispatch,
+} = await import("./src/teachCompletion.mjs");
 
 const SIDECAR_VERSION = "1.0.0";
 
@@ -152,6 +156,26 @@ function parseChatResponseTags(responseText) {
     cancelRequest: cancelTagResult.cancelRequest,
     openRequest: openTagResult.openRequest,
   };
+}
+
+function sanitizeSpeechOnlyText(responseText, { sourceDescription }) {
+  const originalText = String(responseText ?? "");
+  const containedTeachProtocolTag = /\[TEACH:[^\[\]]*(?::[^\[\]]*)?\]/i.test(originalText);
+  const containedCancelProtocolTag = /\[\s*CANCEL\s*:\s*[^\[\]]*\]/i.test(originalText);
+  const teachTagResult = parseTeachTag(originalText);
+  const cancelTagResult = parseCancelTag(teachTagResult.cleanedText);
+  const openTagResult = parseOpenTag(cancelTagResult.cleanedText);
+
+  if (containedTeachProtocolTag) {
+    emitLog("warn", `ignoring leaked teach tag from ${sourceDescription}`);
+  }
+  if (containedCancelProtocolTag) {
+    emitLog("warn", `ignoring leaked cancel tag from ${sourceDescription}`);
+  }
+
+  // These call sites are speech-only: unlike normal chat routing, every
+  // protocol tag is a leak to discard rather than an instruction to execute.
+  return openTagResult.cleanedText.replace(/\[POINT:[^\]]*\]/gi, "").trim();
 }
 
 async function handleCancelLessonBuildRequest(cancelRequest) {
@@ -418,7 +442,7 @@ async function dispatchTeachInstructions({
       "info",
       `teach dispatch → ${backend} model=${model ?? "default"} effort=${lessonEffortLevel} workspace=${workspace.id} instructions="${String(instructions).slice(0, 300).replace(/\r?\n/g, " ")}"`
     );
-    beginTeachTurnHold(workspace.id, correlation);
+    beginTeachTurnHold(workspace.id, backend, correlation);
     teachTurnHoldStarted = true;
     traceAgentEvent("teach.started", { ...correlation, workspaceId: workspace.id, backend, model });
     traceAgentEvent("agent.started", { ...correlation, workspaceId: workspace.id, backend, model });
@@ -456,14 +480,14 @@ async function dispatchTeachInstructions({
     });
     traceAgentEvent("teach.completed", { ...correlation, workspaceId: workspace.id });
 
-    // The workspace notes promise the session that its final message is spoken
-    // aloud — honor that for background dispatches too, so a finished build or
-    // lesson update is announced instead of dying in the logs. Tags are
-    // stripped: a dispatched turn has no screenshot, so a [POINT:...] tag
-    // would be meaningless, and no tag should ever be read aloud.
-    spokenWrapUpText = parseTeachTag(String(turnResult?.text ?? ""))
-      .cleanedText.replace(/\[POINT:[^\]]*\]/gi, "")
-      .trim();
+    const lessonFileNamesAfterDispatch = listLessonFileNames(join(workspace.path, "lessons"));
+    const createdLessonFileNames = lessonFileNamesCreatedDuringDispatch({
+      lessonFileNamesBeforeDispatch,
+      lessonFileNamesAfterDispatch,
+    });
+    if (createdLessonFileNames.length > 0) {
+      spokenWrapUpText = buildLessonCompletionAnnouncement(topicText);
+    }
   } catch (dispatchError) {
     if (
       dispatchError?.clickyErrorCode === "cancelled" ||
@@ -554,7 +578,7 @@ async function startInterview({
   // MISSION.md safely causes the next teach request to begin again.
   traceAgentEvent("interview.started", { ...correlation, workspaceId: workspace.id, backend, model });
   traceAgentEvent("agent.started", { ...correlation, workspaceId: workspace.id, backend, model });
-  beginTeachTurnHold(workspace.id, correlation);
+  beginTeachTurnHold(workspace.id, backend, correlation);
   let turnResult;
   try {
     turnResult =
@@ -688,7 +712,11 @@ async function handleChatRequest(request) {
         backend: activeInterview.backend,
         model: activeInterview.model,
       });
-      beginTeachTurnHold(activeInterview.workspaceId, baseCorrelation);
+      beginTeachTurnHold(
+        activeInterview.workspaceId,
+        activeInterview.backend,
+        baseCorrelation
+      );
       let turnResult;
       try {
         turnResult =
@@ -722,7 +750,15 @@ async function handleChatRequest(request) {
 
       const interviewConclusion = concludeInterviewIfMissionCaptured();
       if (!interviewConclusion.missionCaptured) {
-        armInterviewExpiry();
+        if (reachedTurnCap) {
+          const expiredInterview = interviewTracker.expire();
+          emitLog(
+            "info",
+            `mission interview turn cap reached for ${expiredInterview?.workspaceId ?? activeInterview.workspaceId} without MISSION.md — returning subsequent turns to normal chat`
+          );
+        } else {
+          armInterviewExpiry();
+        }
       }
       let spokenReplyText = cleanedText;
       if (interviewConclusion.buildDispatched) {
@@ -870,7 +906,12 @@ async function handleChatRequest(request) {
                   `interview start for ${interviewStart.workspace.id} was cancelled mid-setup — not arming interview routing`
                 );
               } else {
-                const interviewReplyText = (interviewStart.replyText ?? "").trim();
+                const interviewReplyText = sanitizeSpeechOnlyText(
+                  interviewStart.replyText,
+                  {
+                    sourceDescription: `first interview reply from workspace ${interviewStart.workspace.id}`,
+                  }
+                );
                 responseText = [responseText, interviewReplyText]
                   .filter((part) => part.length > 0)
                   .join(" ");
@@ -913,9 +954,9 @@ async function handleChatRequest(request) {
         }
       }
 
-      // A first mission-interview reply is appended above after the original
-      // chat reply was parsed. Strip any accidental CANCEL or OPEN tag from
-      // that newly added spoken text too, so every response stays protocol-clean.
+      // Preserve the existing final routing pass for any future text appended
+      // after the initial chat parse. First-interview speech is sanitized
+      // earlier, so its protocol tags are deliberately discarded before here.
       const finalCancelTagResult = parseCancelTag(responseText);
       const finalOpenTagResult = parseOpenTag(finalCancelTagResult.cleanedText);
       responseText = finalOpenTagResult.cleanedText;

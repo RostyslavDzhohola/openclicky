@@ -24,17 +24,33 @@ const activeWatchers = new Map();
 /** workspaceId → backend of the most recent chat (for command attribution) */
 const lastBackendForWorkspace = new Map();
 
-function shellCommandsForWorkspace(workspaceId) {
-  const backend = lastBackendForWorkspace.get(workspaceId) ?? "claude";
+function shellCommandsForWorkspace(workspaceId, heldLessonBackend) {
+  const backend =
+    heldLessonBackend ?? lastBackendForWorkspace.get(workspaceId) ?? "claude";
   return backend === "codex"
     ? recentCodexShellCommands(workspaceId)
     : recentClaudeBashCommands(workspaceId);
 }
 
 export function didAgentOpenLesson(shellCommands, lessonFileName) {
-  return shellCommands.some(
-    (command) => command.includes("open") && command.includes(lessonFileName)
-  );
+  return shellCommands.some((command) => {
+    const shellCommandSegments = String(command).split(/&&|\|\||[;|\r\n]/);
+    return shellCommandSegments.some((shellCommandSegment) => {
+      if (!shellCommandSegment.includes(lessonFileName)) return false;
+
+      // Shell assignments may precede a command without changing its command
+      // token. This deliberately recognizes only the simple NAME=value form;
+      // wrappers such as `reopen` must never count as macOS's `open` command.
+      const commandWithoutEnvironmentAssignments = shellCommandSegment
+        .trim()
+        .replace(
+          /^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)*/,
+          ""
+        );
+      const firstCommandToken = commandWithoutEnvironmentAssignments.split(/\s+/, 1)[0];
+      return firstCommandToken === "open";
+    });
+  });
 }
 
 function truncatedCommandsForLog(shellCommands) {
@@ -59,9 +75,16 @@ export function createLessonEventCoordinator({
   /** workspaceId → active, reference-counted teach turn hold */
   const activeTeachTurnHolds = new Map();
 
-  function emitLessonCreated({ workspaceId, addedFilePath, wasHeld, heldForMs, correlation = {} }) {
+  function emitLessonCreated({
+    workspaceId,
+    addedFilePath,
+    wasHeld,
+    heldForMs,
+    heldLessonBackend,
+    correlation = {},
+  }) {
     const lessonFileName = basename(addedFilePath);
-    const shellCommands = getShellCommandsForWorkspace(workspaceId);
+    const shellCommands = getShellCommandsForWorkspace(workspaceId, heldLessonBackend);
     const openedByAgent = didAgentOpenLesson(shellCommands, lessonFileName);
     const truncatedCommands = truncatedCommandsForLog(shellCommands);
 
@@ -95,6 +118,7 @@ export function createLessonEventCoordinator({
         addedFilePath: queuedLesson.addedFilePath,
         wasHeld: true,
         heldForMs,
+        heldLessonBackend: activeTeachTurnHold.backend,
         correlation: activeTeachTurnHold.correlation,
       });
     }
@@ -108,7 +132,7 @@ export function createLessonEventCoordinator({
     return true;
   }
 
-  function beginTeachTurnHold(workspaceId, correlation = {}) {
+  function beginTeachTurnHold(workspaceId, backend, correlation = {}) {
     const existingTeachTurnHold = activeTeachTurnHolds.get(workspaceId);
     if (existingTeachTurnHold) {
       existingTeachTurnHold.referenceCount += 1;
@@ -119,6 +143,7 @@ export function createLessonEventCoordinator({
       referenceCount: 1,
       startedAt: Date.now(),
       queuedLessons: [],
+      backend,
       correlation,
       safetyTimeout: null,
     };
@@ -211,8 +236,8 @@ const lessonEventCoordinator = createLessonEventCoordinator({
   emitTrace: traceAgentEvent,
 });
 
-export function beginTeachTurnHold(workspaceId, correlation) {
-  lessonEventCoordinator.beginTeachTurnHold(workspaceId, correlation);
+export function beginTeachTurnHold(workspaceId, backend, correlation) {
+  lessonEventCoordinator.beginTeachTurnHold(workspaceId, backend, correlation);
 }
 
 export function endTeachTurnHold(workspaceId, { discardQueuedLessons = false } = {}) {

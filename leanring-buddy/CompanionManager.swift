@@ -430,14 +430,13 @@ final class CompanionManager: ObservableObject {
         bindShortcutTransitions()
         ScreenshotFileStore.sweepStaleCaptures()
 
-        // When the brain writes a new lesson, open it in the user's default
-        // editor unless the agent already opened it itself.
+        // Clicky owns the completion action: topic agents are instructed never
+        // to open lessons, so every completed lesson event deterministically
+        // opens exactly once from the app.
         sidecarManager.onLessonCreated = { [weak self] lesson in
             guard let self else { return }
             self.lessonBuildsInProgress.removeValue(forKey: lesson.workspaceId)
-            if lesson.openedByAgent == false {
-                NSWorkspace.shared.open(URL(fileURLWithPath: lesson.path))
-            }
+            NSWorkspace.shared.open(URL(fileURLWithPath: lesson.path))
             // A new lesson just landed on disk — refresh the picker so it appears
             // in the panel without waiting for the panel to be reopened.
             self.refreshLessonTopicListings()
@@ -983,6 +982,11 @@ final class CompanionManager: ObservableObject {
                         )
                         ClickyAnalytics.trackTTSError(error: error.localizedDescription)
                         print("⚠️ Companion TTS error: \(error)")
+                        // The read-along bubble was shown before speakText; a failed
+                        // utterance must not leave it lingering while the unrelated
+                        // fallback line plays.
+                        spokenResponseBubbleClearTask?.cancel()
+                        spokenResponseBubble = nil
                         speakGenericErrorFallback()
                     }
                 }
