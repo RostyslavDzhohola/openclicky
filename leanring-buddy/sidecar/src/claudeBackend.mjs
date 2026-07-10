@@ -136,7 +136,11 @@ class ClaudeWorkspaceSession {
       cwd: workspacePath(workspaceId),
       model: modelAlias,
       systemPrompt: { type: "preset", preset: "claude_code", append: COMPANION_RULES },
-      settingSources: ["user", "project"],
+      // Project-only: sessions must load ONLY the config the app ships into the
+      // workspace (.claude/skills/teach etc.). Including "user" here would pull
+      // in the user's personal ~/.claude hooks, skills, output styles, and
+      // plugins, making the lesson agent behave differently per machine.
+      settingSources: ["project"],
       skills: "all",
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
