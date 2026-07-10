@@ -786,7 +786,13 @@ async function handleChatRequest(request) {
       if (interviewConclusion.buildDispatched) {
         // The teach session's own wrap-up ("your course is set up") says nothing
         // about the multi-minute build that follows — set that expectation now.
-        spokenReplyText = spokenReplyText + BUILD_HANDOFF_SPOKEN_NOTE;
+        // Appending after a trailing [POINT:...] tag would strand that tag
+        // mid-sentence, where the app's end-of-response parser cannot strip it
+        // and TTS would read it aloud. Pointing is useless on a handoff turn,
+        // so drop the tag before appending.
+        spokenReplyText =
+          spokenReplyText.replace(/\[POINT:[^\]]*\]/gi, "").trim() +
+          BUILD_HANDOFF_SPOKEN_NOTE;
       }
       traceAgentEvent("response.emitted", {
         ...baseCorrelation,
