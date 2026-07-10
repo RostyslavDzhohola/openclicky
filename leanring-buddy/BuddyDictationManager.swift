@@ -867,8 +867,17 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         // which device and format a session actually recorded from.
         print("🎙️ BuddyDictationManager: capturing from \(currentSessionCaptureDeviceDescription) at \(Int(inputFormat.sampleRate))Hz/\(inputFormat.channelCount)ch")
 
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
-            self?.activeTranscriptionSession?.appendAudioBuffer(buffer)
+        // The tap fires on AVFoundation's internal queue while the main actor
+        // may concurrently tear the session down (device change, cancel,
+        // finish). Reading the activeTranscriptionSession PROPERTY from here
+        // races those writes and can return a mid-release object — a crash in
+        // objc_msgSend on an audio worker queue (seen in the field when
+        // connecting headphones mid-session). Capture this session strongly
+        // instead: the closure keeps it alive for the tap's lifetime, the tap
+        // can never feed a newer session by accident, and appendAudioBuffer is
+        // internally guarded once the final transcript has been requested.
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self, activeTranscriptionSession] buffer, _ in
+            activeTranscriptionSession.appendAudioBuffer(buffer)
             self?.updateAudioPowerLevel(from: buffer)
         }
 
