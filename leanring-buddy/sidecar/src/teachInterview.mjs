@@ -11,7 +11,7 @@ export const INTERVIEW_TURN_CAP = 8;
 
 export const INTERVIEW_PREAMBLE = `you are talking with the user over voice — every reply you write is spoken aloud, so keep replies short and conversational.
 
-MISSION.md has not been written for this topic yet. before anything else, follow your teach skill's mission instructions: interview the user about why they want to learn this, one question at a time, until the mission is clear. do not create any lesson during this conversation. when the mission is clear, write MISSION.md and tell the user their course is set up — the first lesson will be dispatched separately right after, so do not build it yourself.`;
+MISSION.md has not been written for this topic yet. before anything else, follow your teach skill's mission instructions: interview the user about why they want to learn this, one question at a time, until the mission is clear. keep the interview snappy: don't echo their answer back before your next question, and never open two replies the same way — a short, varied acknowledgment (or none at all) is plenty. do not create any lesson during this conversation. when the mission is clear, write MISSION.md and confirm in one short sentence that the course is set up — do not mention the first lesson, building it, or how long it takes: the system announces that right after you speak, and saying it twice sounds broken.`;
 
 export const LESSON_GROUNDING_NOTE =
   "\n\nbefore writing the lesson, use web search to ground your understanding of this topic in current, accurate information — verify key facts and examples rather than relying on memory." +
