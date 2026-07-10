@@ -3,13 +3,16 @@
 // The Codex SDK wraps the codex CLI. With no apiKey passed and no
 // OPENAI_API_KEY/CODEX_API_KEY in the environment (guaranteed by
 // src/env.mjs), the CLI uses the ChatGPT-plan login cached by `codex login`
-// in ~/.codex/auth.json — the officially supported subscription path.
+// with a relocated CODEX_HOME whose auth.json symlinks to ~/.codex/auth.json —
+// login stays shared while config is isolated. The CLI's sessions/rollouts
+// consequently live under the app's codex-home instead of ~/.codex/sessions.
 //
 // Thread ids are persisted to each workspace's .clicky.json so a sidecar
 // restart resumes the same conversation via codex.resumeThread().
 
 import { tmpdir } from "node:os";
 import { Codex } from "@openai/codex-sdk";
+import { buildCodexChildEnvironment } from "./codexHome.mjs";
 import { emitLog } from "./protocol.mjs";
 import {
   readWorkspaceMetadata,
@@ -17,7 +20,8 @@ import {
   workspacePath,
 } from "./workspaces.mjs";
 
-const codexClient = new Codex();
+// See codexHome.mjs for the isolated config and shared-login contract.
+const codexClient = new Codex({ env: buildCodexChildEnvironment() });
 
 function resolveCodexModel(requestedModel) {
   const model = String(requestedModel ?? "").trim();
