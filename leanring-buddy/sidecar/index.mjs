@@ -73,9 +73,11 @@ const {
   endTeachTurnHold,
   watchWorkspaceLessons,
 } = await import("./src/lessonWatcher.mjs");
-const { clearPendingDispatch, recordPendingDispatch, takePendingDispatches } = await import(
-  "./src/teachDispatchQueue.mjs"
-);
+const {
+  clearPendingDispatch,
+  loadPendingDispatchesForRecovery,
+  recordPendingDispatch,
+} = await import("./src/teachDispatchQueue.mjs");
 const {
   buildLessonCompletionAnnouncement,
   lessonFileNamesCreatedDuringDispatch,
@@ -316,6 +318,7 @@ async function dispatchTeachInstructions({
   traceId,
   parentTurnId,
   interviewId,
+  priorQueueEntry = null,
 }) {
   const workspaceIdForTopic = slugifyTopicName(topicText);
   if (teachDispatchRegistry.activeDispatch(workspaceIdForTopic)) {
@@ -326,7 +329,11 @@ async function dispatchTeachInstructions({
     return;
   }
 
-  const requestId = `teach-dispatch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  // A recovered dispatch reuses its durable entry's id so the entry stays
+  // owned by (and is cleared with) this dispatch rather than duplicating.
+  const requestId =
+    priorQueueEntry?.id ??
+    `teach-dispatch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const dispatchEntry = teachDispatchRegistry.beginDispatch({
     workspaceId: workspaceIdForTopic,
     requestId,
@@ -348,13 +355,16 @@ async function dispatchTeachInstructions({
     interviewId,
     agentRole: "topic-builder",
   };
+  // Recovery must preserve the first enqueue time: otherwise a crashlooping
+  // sidecar would refresh the 24-hour staleness window on every restart.
+  const recordedCreatedAt = priorQueueEntry?.createdAt ?? Date.now();
   recordPendingDispatch({
     id: requestId,
     backend,
     model,
     topicText,
     instructions,
-    createdAt: Date.now(),
+    createdAt: recordedCreatedAt,
     ...correlation,
   });
   traceAgentEvent("teach.queued", { ...correlation, backend, model, topicText });
@@ -1165,15 +1175,17 @@ ensureTeachSkillInstalled(null).catch((bootstrapError) => {
   emitLog("warn", `teach skill bootstrap failed: ${bootstrapError?.message ?? bootstrapError}`);
 });
 
-const { pendingDispatches, droppedStaleCount } = takePendingDispatches(24 * 60 * 60 * 1000);
+const { pendingDispatches, droppedStaleCount } = loadPendingDispatchesForRecovery(
+  24 * 60 * 60 * 1000
+);
 for (const pendingDispatch of pendingDispatches) {
   emitLog(
     "info",
     `recovering pending teach dispatch → ${pendingDispatch.backend} topic=${pendingDispatch.topicText}`
   );
   const recoveredTopicWorkspaceDirectory = workspacePath(slugifyTopicName(pendingDispatch.topicText));
-  // Re-dispatching creates a fresh durable entry before any lesson work starts.
-  // A pre-feature durable entry can have no mission, and recovery has no chat
+  // The entry stays durable until this recovered dispatch settles. A
+  // pre-feature durable entry can have no mission, and recovery has no chat
   // turn available to relay an interview into.
   void dispatchTeachInstructions({
     backend: pendingDispatch.backend,
@@ -1186,6 +1198,7 @@ for (const pendingDispatch of pendingDispatches) {
     traceId: pendingDispatch.traceId,
     parentTurnId: pendingDispatch.parentTurnId,
     interviewId: pendingDispatch.interviewId,
+    priorQueueEntry: pendingDispatch,
   });
 }
 if (droppedStaleCount > 0) {
