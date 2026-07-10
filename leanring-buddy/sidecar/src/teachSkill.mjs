@@ -12,22 +12,15 @@
 
 import { execFile } from "node:child_process";
 import { cpSync, existsSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { applicationSupportDirectory } from "./appSupport.mjs";
 import { emitLog } from "./protocol.mjs";
 
 const execFileAsync = promisify(execFile);
 
 const TEACH_INSTALL_TIMEOUT_MS = 180_000;
-
-function applicationSupportDirectory() {
-  return (
-    process.env.CLICKY_APP_SUPPORT ??
-    join(homedir(), "Library", "Application Support", "OpenClicky")
-  );
-}
 
 function templateDirectory() {
   return join(applicationSupportDirectory(), "teach-template");
