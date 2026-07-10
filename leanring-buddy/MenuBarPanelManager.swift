@@ -131,6 +131,12 @@ final class MenuBarPanelManager: NSObject {
             createPanel()
         }
 
+        // The panel is reused across opens (hidden, not recreated), so the
+        // view's own .onAppear fires only once — re-read the lessons from disk
+        // on every open so topics deleted or added since the last open are
+        // reflected instead of a stale cache.
+        companionManager.refreshLessonTopicListings()
+
         positionPanelBelowStatusItem()
 
         panel?.makeKeyAndOrderFront(nil)
