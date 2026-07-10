@@ -95,7 +95,8 @@ async function dispatchTeachInstructions({ backend, model, topicText, instructio
 
     const groundedInstructions =
       instructions +
-      "\n\nbefore writing the lesson, use web search to ground your understanding of this topic in current, accurate information — verify key facts and examples rather than relying on memory.";
+      "\n\nbefore writing the lesson, use web search to ground your understanding of this topic in current, accurate information — verify key facts and examples rather than relying on memory." +
+      "\n\nin any quiz, randomize which option position holds the correct answer, and keep all options the same length and word count so formatting gives no clues.";
 
     const dispatchArguments = {
       requestId: `teach-dispatch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -107,6 +108,10 @@ async function dispatchTeachInstructions({ backend, model, topicText, instructio
       teachIntent: true,
       onStatus: null,
     };
+    emitLog(
+      "info",
+      `teach dispatch → ${backend} model=${model ?? "default"} effort=${lessonEffortLevel} workspace=${workspace.id}`
+    );
     let turnResult;
     if (backend === "codex") {
       turnResult = await runCodexChatTurn(dispatchArguments);
