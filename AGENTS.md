@@ -127,6 +127,8 @@ npm run drive -- --backend claude --image ../codex-add-project.png
 npm run drive:teach -- --backend codex --topic "css flexbox"
 ```
 
+**Agents: verify with `npm test` only.** The `npm run drive*` commands run live turns against real Claude/ChatGPT subscriptions — teach drives build entire lessons and take many minutes. Agents must NOT run them; document which drive would verify a change and leave running it to the user.
+
 Dev override: set the `clickySidecarDevPath` UserDefaults key to the repo's `leanring-buddy/sidecar` path to make the app spawn straight from the repo instead of the Application Support install.
 
 ## Cloudflare Worker (optional legacy)
@@ -183,6 +185,7 @@ IMPORTANT: Follow these naming rules strictly. Clarity is the top priority.
 - Do not try to fix the known non-blocking warnings (Swift 6 concurrency, deprecated onChange)
 - Do not rename the project directory or scheme (the "leanring" typo is intentional/legacy)
 - Do not run `xcodebuild` from the terminal — it invalidates TCC permissions
+- Do not run live sidecar drives (`npm run drive*`) — they are slow and burn real subscription quota. Verify sidecar changes with `npm test` (unit tests) and let the user run the drives
 
 ## Git Workflow
 

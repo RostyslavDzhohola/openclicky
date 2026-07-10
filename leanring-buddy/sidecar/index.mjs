@@ -48,6 +48,11 @@ const { ensureTeachSkillInstalled, teachSkillInstallState } = await import(
   "./src/teachSkill.mjs"
 );
 const { watchWorkspaceLessons } = await import("./src/lessonWatcher.mjs");
+const {
+  clearPendingDispatch,
+  loadPendingDispatchesForRecovery,
+  recordPendingDispatch,
+} = await import("./src/teachDispatchQueue.mjs");
 
 const SIDECAR_VERSION = "1.0.0";
 
@@ -75,7 +80,28 @@ function armChatIdleReset() {
  * teachError event the app speaks, and success surfaces as the existing
  * lessonCreated event from the watcher.
  */
-async function dispatchTeachInstructions({ backend, model, topicText, instructions }) {
+async function dispatchTeachInstructions({
+  backend,
+  model,
+  topicText,
+  instructions,
+  priorQueueEntry = null,
+}) {
+  const requestId =
+    priorQueueEntry?.id ??
+    `teach-dispatch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  // Recovery must preserve the first enqueue time: otherwise a crashlooping
+  // sidecar would refresh the 24-hour staleness window on every restart.
+  const recordedCreatedAt = priorQueueEntry?.createdAt ?? Date.now();
+  recordPendingDispatch({
+    id: requestId,
+    backend,
+    model,
+    topicText,
+    instructions,
+    createdAt: recordedCreatedAt,
+  });
+
   let workspace;
   try {
     workspace = createWorkspace(topicText);
@@ -95,10 +121,11 @@ async function dispatchTeachInstructions({ backend, model, topicText, instructio
 
     const groundedInstructions =
       instructions +
-      "\n\nbefore writing the lesson, use web search to ground your understanding of this topic in current, accurate information — verify key facts and examples rather than relying on memory.";
+      "\n\nbefore writing the lesson, use web search to ground your understanding of this topic in current, accurate information — verify key facts and examples rather than relying on memory." +
+      "\n\nin any quiz, randomize which option position holds the correct answer, and keep all options the same length and word count so formatting gives no clues.";
 
     const dispatchArguments = {
-      requestId: `teach-dispatch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      requestId,
       workspaceId: workspace.id,
       model,
       effort: lessonEffortLevel,
@@ -107,6 +134,10 @@ async function dispatchTeachInstructions({ backend, model, topicText, instructio
       teachIntent: true,
       onStatus: null,
     };
+    emitLog(
+      "info",
+      `teach dispatch → ${backend} model=${model ?? "default"} effort=${lessonEffortLevel} workspace=${workspace.id}`
+    );
     let turnResult;
     if (backend === "codex") {
       turnResult = await runCodexChatTurn(dispatchArguments);
@@ -122,6 +153,9 @@ async function dispatchTeachInstructions({ backend, model, topicText, instructio
       topicName: topicText,
       message: String(dispatchError?.message ?? dispatchError),
     });
+  } finally {
+    // Only an abrupt process death should leave work in the durable queue.
+    clearPendingDispatch(requestId);
   }
 }
 
@@ -315,6 +349,27 @@ for (const workspace of listWorkspaces()) {
 ensureTeachSkillInstalled(null).catch((bootstrapError) => {
   emitLog("warn", `teach skill bootstrap failed: ${bootstrapError?.message ?? bootstrapError}`);
 });
+
+const { pendingDispatches, droppedStaleCount } = loadPendingDispatchesForRecovery(
+  24 * 60 * 60 * 1000
+);
+for (const pendingDispatch of pendingDispatches) {
+  emitLog(
+    "info",
+    `recovering pending teach dispatch → ${pendingDispatch.backend} topic=${pendingDispatch.topicText}`
+  );
+  // The entry stays durable until this recovered dispatch settles.
+  void dispatchTeachInstructions({
+    backend: pendingDispatch.backend,
+    model: pendingDispatch.model,
+    topicText: pendingDispatch.topicText,
+    instructions: pendingDispatch.instructions,
+    priorQueueEntry: pendingDispatch,
+  });
+}
+if (droppedStaleCount > 0) {
+  emitLog("info", `dropped ${droppedStaleCount} stale pending teach dispatches`);
+}
 
 const stdinReader = createInterface({ input: process.stdin });
 

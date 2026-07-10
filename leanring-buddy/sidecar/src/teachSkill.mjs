@@ -1,10 +1,10 @@
 // Teach-skill installation.
 //
-// Matt Pocock's teach skill is installed ONCE into a template directory via
-// the real `npx skills` installer (so we get the exact published skill,
-// never a reimplementation), then file-copied into each new workspace. This
-// keeps workspace creation fast, offline-capable after the first run, and
-// immune to interactive installer prompts.
+// Matt Pocock's teach skill ships with the app as a checked-in vanilla-installer
+// snapshot, refreshed deliberately with `npm run refresh-teach-template`. The
+// snapshot is the untouched installer output, preserving the unmodified-skill
+// principle, while `npx skills` remains a fallback if that bundled copy is
+// unavailable. The template is then file-copied into each new workspace.
 //
 // Layout replicated per workspace (matching the vanilla install exactly):
 //   .agents/skills/teach/SKILL.md (+ FORMAT files)  ← read by Codex
@@ -12,21 +12,15 @@
 
 import { execFile } from "node:child_process";
 import { cpSync, existsSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { applicationSupportDirectory } from "./appSupport.mjs";
 import { emitLog } from "./protocol.mjs";
 
 const execFileAsync = promisify(execFile);
 
 const TEACH_INSTALL_TIMEOUT_MS = 180_000;
-
-function applicationSupportDirectory() {
-  return (
-    process.env.CLICKY_APP_SUPPORT ??
-    join(homedir(), "Library", "Application Support", "OpenClicky")
-  );
-}
 
 function templateDirectory() {
   return join(applicationSupportDirectory(), "teach-template");
@@ -34,6 +28,11 @@ function templateDirectory() {
 
 function templateTeachSkillPath() {
   return join(templateDirectory(), ".agents", "skills", "teach");
+}
+
+function bundledTemplateDirectory() {
+  const currentModuleDirectory = dirname(fileURLToPath(import.meta.url));
+  return join(currentModuleDirectory, "..", "teach-template");
 }
 
 /** Remembered install outcome, surfaced to the app via authStatus. */
@@ -47,6 +46,24 @@ export function teachSkillInstallState() {
 async function bootstrapTemplate() {
   if (existsSync(join(templateTeachSkillPath(), "SKILL.md"))) {
     installState = { installed: true, message: "ok" };
+    return;
+  }
+
+  const bundledTeachTemplateDirectory = bundledTemplateDirectory();
+  const bundledTeachSkillPath = join(
+    bundledTeachTemplateDirectory,
+    ".agents",
+    "skills",
+    "teach",
+    "SKILL.md"
+  );
+  if (existsSync(bundledTeachSkillPath)) {
+    // The app installs its sidecar wholesale, so this snapshot is available
+    // alongside index.mjs without requiring first-launch network access.
+    mkdirSync(applicationSupportDirectory(), { recursive: true });
+    cpSync(bundledTeachTemplateDirectory, templateDirectory(), { recursive: true });
+    installState = { installed: true, message: "ok" };
+    emitLog("info", "used bundled teach skill template");
     return;
   }
 

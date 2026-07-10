@@ -5,4 +5,8 @@ worker/.dev.vars
 build/
 releases/
 .claude/
+# The bundled teach-skill template must ship BOTH agent layouts the vanilla
+# installer produces; without this negation the .claude/ rule above would
+# silently drop half the checked-in snapshot.
+!leanring-buddy/sidecar/teach-template/.claude/
 coding-plans/
