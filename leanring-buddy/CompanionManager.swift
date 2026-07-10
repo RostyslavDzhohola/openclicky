@@ -126,7 +126,9 @@ final class CompanionManager: ObservableObject {
         UserDefaults.standard.set(effort, forKey: "selectedClaudeEffort")
     }
 
-    @Published var selectedCodexModel: String = UserDefaults.standard.string(forKey: "selectedCodexModel") ?? "default"
+    // GPT-5.5 is the only Codex model the panel offers; older builds persisted
+    // "default" or "gpt-5.5-codex", so stale stored values are coerced here.
+    @Published var selectedCodexModel: String = "gpt-5.5"
 
     func setSelectedCodexModel(_ model: String) {
         selectedCodexModel = model

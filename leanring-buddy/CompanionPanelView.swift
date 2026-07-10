@@ -556,9 +556,7 @@ struct CompanionPanelView: View {
             segmentedPickerRow(
                 label: "Model",
                 options: [
-                    (displayName: "Default", value: "default"),
-                    (displayName: "GPT-5.5", value: "gpt-5.5"),
-                    (displayName: "Codex", value: "gpt-5.5-codex")
+                    (displayName: "GPT-5.5", value: "gpt-5.5")
                 ],
                 selectedValue: companionManager.selectedCodexModel,
                 onSelect: { companionManager.setSelectedCodexModel($0) }
