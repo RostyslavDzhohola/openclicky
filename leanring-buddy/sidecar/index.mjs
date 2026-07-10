@@ -182,6 +182,18 @@ async function dispatchTeachInstructions({ backend, model, topicText, instructio
     }
     const resultPreview = String(turnResult?.text ?? "").slice(0, 200);
     emitLog("info", `teach dispatch for ${workspace.id} finished: ${resultPreview}`);
+
+    // The workspace notes promise the session that its final message is spoken
+    // aloud — honor that for background dispatches too, so a finished build or
+    // lesson update is announced instead of dying in the logs. Tags are
+    // stripped: a dispatched turn has no screenshot, so a [POINT:...] tag
+    // would be meaningless, and no tag should ever be read aloud.
+    const spokenWrapUpText = parseTeachTag(String(turnResult?.text ?? ""))
+      .cleanedText.replace(/\[POINT:[^\]]*\]/gi, "")
+      .trim();
+    if (spokenWrapUpText.length > 0) {
+      emitEvent({ type: "speak", text: spokenWrapUpText });
+    }
   } catch (dispatchError) {
     emitEvent({
       type: "teachError",

@@ -561,7 +561,17 @@ async function runInterviewDrive() {
     600_000
   );
 
-  console.log("\n[PASS] interview ran, mission captured, lesson built");
+  // The finished build must be announced aloud: a speak event with no request
+  // id (the interview-start ack carried the chat request's id; the completion
+  // announcement is fired outside any request). The dispatch turn can wrap up
+  // slightly after lessonCreated, so allow a generous window.
+  const buildCompletionSpeakPredicate = (event) =>
+    event.type === "speak" && !event.id && typeof event.text === "string" && event.text.trim().length > 0;
+  if (!sidecar.allEvents.some(buildCompletionSpeakPredicate)) {
+    await sidecar.waitFor(buildCompletionSpeakPredicate, 180_000);
+  }
+
+  console.log("\n[PASS] interview ran, mission captured, lesson built and announced");
   await sidecar.stop();
 }
 

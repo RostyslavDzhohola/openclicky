@@ -37,7 +37,7 @@ The app spawns `node index.mjs` from `~/Library/Application Support/OpenClicky/s
 | `authStatus` | login detection for both backends + teach-skill install state |
 | `cancel` / `shutdown` | interrupt an in-flight turn / graceful exit |
 
-Events: `ready` (carries `lessonsRoot` + `dashboardPath`), `status` (per-turn progress), `result`, `error` (codes: `auth_required`, `skill_install_failed`, `workspace_missing`, `cancelled`, `node_backend_crash`, `internal`), `speak` (a line the app voices immediately, ahead of the final result — used for the course-setup ack before the synchronous interview turn), `teachBuildStarted` (a background lesson build began — drives the panel's "building your lesson" indicator until `lessonCreated`/`teachError`), `lessonCreated`, `teachError` (background lesson dispatch failed — spoken by the app), `log`.
+Events: `ready` (carries `lessonsRoot` + `dashboardPath`), `status` (per-turn progress), `result`, `error` (codes: `auth_required`, `skill_install_failed`, `workspace_missing`, `cancelled`, `node_backend_crash`, `internal`), `speak` (a line the app voices immediately — the course-setup ack before the synchronous interview turn, and the finished-build announcement after a background dispatch), `teachBuildStarted` (a background lesson build began — drives the panel's "building your lesson" indicator until `lessonCreated`/`teachError`), `lessonCreated`, `teachError` (background lesson dispatch failed — spoken by the app), `log`.
 
 Auth hygiene: the sidecar strips `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/`CODEX_API_KEY` from its environment so both SDKs fall back to subscription logins. The sanctioned Anthropic API-key path is opt-in via the `clickyAnthropicAPIKey` UserDefaults key (forwarded as `CLICKY_ANTHROPIC_API_KEY`).
 

@@ -83,8 +83,8 @@ Requests (stdin): `chat`, `oneShot`, `createWorkspace`, `listWorkspaces`,
 Events (stdout): `ready`, `status` (per-turn progress), `result`, `error`
 (codes: `auth_required`, `skill_install_failed`, `workspace_missing`,
 `cancelled`, `node_backend_crash`, `internal`), `speak` (a line the app
-voices immediately, ahead of the final result — the course-setup ack before
-the synchronous interview turn), `teachBuildStarted` (a background lesson
+voices immediately — the course-setup ack before the synchronous interview
+turn, and the finished-build announcement after a dispatch), `teachBuildStarted` (a background lesson
 build began; pairs with `lessonCreated`/`teachError` for progress UI),
 `lessonCreated` (with `openedByAgent` so exactly one browser tab opens),
 `teachError` (a dispatched background lesson failed — skill install or
