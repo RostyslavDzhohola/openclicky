@@ -79,6 +79,10 @@ final class CompanionManager: ObservableObject {
     let buddyDictationManager = BuddyDictationManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
+
+    /// Cursor-following text bubble that mirrors whatever Clicky is speaking,
+    /// so the user can read along with the TTS.
+    private let responseTextOverlayManager = CompanionResponseOverlayManager()
     let sidecarManager = SidecarProcessManager()
     // Response text is now displayed inline on the cursor overlay via
     // streamingResponseText, so no separate response overlay manager is needed.
@@ -478,6 +482,7 @@ final class CompanionManager: ObservableObject {
             self.longTurnAcknowledgementTask?.cancel()
             self.longTurnAcknowledgementTask = nil
             self.hasScheduledLongTurnAcknowledgementForCurrentTurn = true
+            self.displaySpokenTextBubble(spokenLine)
             Task { @MainActor in
                 try? await self.textToSpeechClient.speakText(spokenLine)
             }
@@ -730,6 +735,7 @@ final class CompanionManager: ObservableObject {
             // Cancel any in-progress response and TTS from a previous utterance
             currentResponseTask?.cancel()
             textToSpeechClient.stopPlayback()
+            responseTextOverlayManager.hideOverlay()
             clearDetectedElementLocation()
 
             ClickyAnalytics.trackPushToTalkStarted()
@@ -889,6 +895,7 @@ final class CompanionManager: ObservableObject {
                 // Play the response via TTS. Keep the spinner (processing state)
                 // until the audio actually starts playing, then switch to responding.
                 if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    displaySpokenTextBubble(spokenText)
                     do {
                         try await textToSpeechClient.speakText(spokenText)
                         // speakText returns after player.play() — audio is now playing
@@ -923,6 +930,19 @@ final class CompanionManager: ObservableObject {
     /// schedule it more than once. Waits 8 seconds and, only if the turn is
     /// still running (task not cancelled), speaks a single reassuring line. This
     /// deliberately does NOT change voiceState — the processing spinner stays.
+    /// Shows a spoken line as a cursor-following text bubble so the user can
+    /// read along with the TTS. There is no token streaming — replies arrive
+    /// whole — so the bubble shows the full text at once and stays up roughly
+    /// as long as the speech takes (reading pace ≈ speaking pace, ~13
+    /// characters per second), with a floor so short lines linger long enough
+    /// to read.
+    private func displaySpokenTextBubble(_ spokenText: String) {
+        responseTextOverlayManager.showOverlayAndBeginStreaming()
+        responseTextOverlayManager.updateStreamingText(spokenText)
+        let estimatedSpeechSeconds = max(6, min(60, Double(spokenText.count) / 13.0))
+        responseTextOverlayManager.finishStreaming(hideAfterSeconds: estimatedSpeechSeconds)
+    }
+
     private func scheduleLongTurnAcknowledgementIfNeeded() {
         guard !hasScheduledLongTurnAcknowledgementForCurrentTurn else { return }
         hasScheduledLongTurnAcknowledgementForCurrentTurn = true
