@@ -17,11 +17,12 @@
 // Pass --real to use the real ~/Documents/OpenClicky Lessons + Application Support.
 
 import { spawn } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
+import { chatModelForBackend } from "./chatModelForBackend.mjs";
 
 const sidecarDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -39,10 +40,6 @@ function flagValue(flagName, defaultValue) {
 const useRealDirectories = commandLineArguments.includes("--real");
 const backend = flagValue("--backend", "claude");
 const workspaceId = flagValue("--workspace", "general");
-
-function chatModelForBackend(selectedBackend) {
-  return selectedBackend === "claude" ? "claude-sonnet-4-6" : "default";
-}
 
 const driveEnvironment = { ...process.env };
 if (!useRealDirectories) {
@@ -158,7 +155,8 @@ function assertCondition(condition, failureMessage) {
 
 async function startSidecar() {
   const sidecar = new SidecarProcess();
-  await sidecar.waitFor((event) => event.type === "ready", 15_000);
+  const readyEvent = await sidecar.waitFor((event) => event.type === "ready", 15_000);
+  sidecar.lessonsRoot = readyEvent.lessonsRoot;
   return sidecar;
 }
 
@@ -376,11 +374,7 @@ async function runSplitDrive() {
   console.log(`[drive] lesson created: ${lessonEvent.path}`);
 
   // 3. Dashboard exists and links the new lesson.
-  const { readFileSync } = await import("node:fs");
-  const dashboardHtml = readFileSync(
-    join(driveEnvironment.CLICKY_LESSONS_ROOT ?? "", "index.html"),
-    "utf8"
-  );
+  const dashboardHtml = readFileSync(join(sidecar.lessonsRoot, "index.html"), "utf8");
   assertCondition(
     dashboardHtml.includes("drive-split-topic"),
     "dashboard does not list the dispatched topic"

@@ -38,8 +38,9 @@ with one thin, backend-agnostic router between them.
 ### Chat plane (ephemeral)
 
 - One chat session per backend, detached from workspace folders. The "general"
-  workspace is removed; chat sessions run against an internal scratch directory
-  that is never listed as a topic.
+  workspace is retained on disk but no longer routed to or listed as a topic;
+  chat sessions run against an internal scratch directory that is never listed
+  as a topic.
 - The sidecar resets the chat session after ~10 minutes of inactivity and on app
   restart.
 - **Topic roster injection:** every chat turn, the sidecar includes a compact roster
@@ -105,8 +106,9 @@ feedback, quit) is unchanged.
 
 ## Error handling
 
-- Teach generation failure → surfaced through the existing sidecar `error` events
-  and spoken to the user.
+- Teach generation failure → surfaced through a dedicated `teachError` event
+  (`{ type: "teachError", workspaceId, topicName, message }`, distinct from the
+  per-request `error` events) and spoken to the user.
 - Malformed tag syntax (wrong shape, empty instructions) → treated as plain speech;
   nothing is dispatched. This is distinct from a well-formed tag naming a new topic,
   which creates the workspace (see the router section).

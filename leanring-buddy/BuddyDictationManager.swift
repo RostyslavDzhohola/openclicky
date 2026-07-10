@@ -232,6 +232,10 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     /// input" (which is what macOS auto-routes to AirPods, the case this picker
     /// exists to override).
     private static let preferredMicrophoneUIDDefaultsKey = "clickyPreferredMicrophoneUID"
+    /// UserDefaults key holding the pre-session default input device UID while
+    /// a pinned microphone is active, so a crash or force-quit can restore the
+    /// user's system-wide default on the next launch.
+    private static let defaultInputDeviceUIDToRestoreAfterCrashDefaultsKey = "clickyDefaultInputDeviceUIDToRestoreAfterCrash"
     /// Peak session power (on the same 0–1 scale as `currentAudioPowerLevel`,
     /// i.e. RMS boosted by 10.2 and clamped) below which a session is considered
     /// to have captured no audible speech. Normal speech peaks well above 0.1;
@@ -332,6 +336,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         self.transcriptionProvider = transcriptionProvider
         self.transcriptionProviderDisplayName = transcriptionProvider.displayName
         super.init()
+        restoreDefaultInputDeviceAfterUnexpectedTerminationIfNeeded()
     }
 
     func updateContextualKeyterms(_ contextualKeyterms: [String]) {
@@ -402,6 +407,75 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         }
         guard translationStatus == noErr, resolvedDeviceID != kAudioObjectUnknown else { return nil }
         return resolvedDeviceID
+    }
+
+    /// Reads a device's persistent CoreAudio UID so a default-input restore can
+    /// survive launches, where the numeric `AudioDeviceID` is not stable.
+    private func audioDeviceUID(for inputDeviceID: AudioDeviceID) -> String? {
+        var deviceUIDAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceUID: CFString = "" as CFString
+        var deviceUIDSize = UInt32(MemoryLayout<CFString>.size)
+        let readStatus = AudioObjectGetPropertyData(
+            inputDeviceID,
+            &deviceUIDAddress,
+            0,
+            nil,
+            &deviceUIDSize,
+            &deviceUID
+        )
+        guard readStatus == noErr else { return nil }
+        return deviceUID as String
+    }
+
+    /// Records the original default before changing it so an interrupted
+    /// session can be repaired next launch. An existing value is older and
+    /// therefore belongs to the user's true pre-session default.
+    private func persistDefaultInputDeviceForCrashRecoveryIfNeeded(
+        _ previousDefaultInputDeviceID: AudioDeviceID?
+    ) {
+        guard UserDefaults.standard.string(forKey: Self.defaultInputDeviceUIDToRestoreAfterCrashDefaultsKey) == nil else {
+            return
+        }
+        guard let previousDefaultInputDeviceID else {
+            print("⚠️ BuddyDictationManager: could not persist the previous default input because CoreAudio did not return a device")
+            return
+        }
+        guard let previousDefaultInputDeviceUID = audioDeviceUID(for: previousDefaultInputDeviceID) else {
+            print("⚠️ BuddyDictationManager: could not persist the previous default input because its device UID could not be read")
+            return
+        }
+        UserDefaults.standard.set(
+            previousDefaultInputDeviceUID,
+            forKey: Self.defaultInputDeviceUIDToRestoreAfterCrashDefaultsKey
+        )
+    }
+
+    /// Repairs the system default after a prior session was interrupted before
+    /// its normal teardown could restore it. The saved intent is one-shot so a
+    /// disconnected device cannot cause repeated restoration attempts.
+    private func restoreDefaultInputDeviceAfterUnexpectedTerminationIfNeeded() {
+        guard let defaultInputDeviceUIDToRestore = UserDefaults.standard.string(
+            forKey: Self.defaultInputDeviceUIDToRestoreAfterCrashDefaultsKey
+        ) else {
+            return
+        }
+        defer {
+            UserDefaults.standard.removeObject(
+                forKey: Self.defaultInputDeviceUIDToRestoreAfterCrashDefaultsKey
+            )
+        }
+
+        guard let defaultInputDeviceIDToRestore = audioDeviceID(forUID: defaultInputDeviceUIDToRestore) else {
+            print("⚠️ BuddyDictationManager: failed to restore the previous default input because device UID \(defaultInputDeviceUIDToRestore) is unavailable")
+            return
+        }
+        if !setSystemDefaultInputDevice(defaultInputDeviceIDToRestore) {
+            print("⚠️ BuddyDictationManager: failed to restore the previous default input after an interrupted dictation session")
+        }
     }
 
     /// Reads the system's current default input device from CoreAudio, or `nil`
@@ -487,6 +561,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
 
         if setSystemDefaultInputDevice(preferredDeviceID) {
             defaultInputDeviceIDToRestoreAfterSession = previousDefaultInputDeviceID
+            persistDefaultInputDeviceForCrashRecoveryIfNeeded(previousDefaultInputDeviceID)
             currentSessionCaptureDeviceDescription = "\(pinnedMicrophoneDisplayName) (pinned via default-input switch)"
         } else {
             print("⚠️ BuddyDictationManager: failed to make \(pinnedMicrophoneDisplayName) the default input; using system default input")
@@ -503,6 +578,9 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         if !setSystemDefaultInputDevice(previousDefaultInputDeviceID) {
             print("⚠️ BuddyDictationManager: failed to restore the previous default input (device \(previousDefaultInputDeviceID))")
         }
+        UserDefaults.standard.removeObject(
+            forKey: Self.defaultInputDeviceUIDToRestoreAfterCrashDefaultsKey
+        )
     }
 
     func startPersistentDictationFromMicrophoneButton(

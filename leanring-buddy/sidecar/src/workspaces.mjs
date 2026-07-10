@@ -44,6 +44,18 @@ function clickyMetadataPath(workspaceId) {
   return join(workspacePath(workspaceId), ".clicky.json");
 }
 
+function syncAgentsFileWithExpectedContent(directoryPath, expectedAgentsFileContent) {
+  const agentsFilePath = join(directoryPath, "AGENTS.md");
+  const currentAgentsFileContent = existsSync(agentsFilePath)
+    ? readFileSync(agentsFilePath, "utf8")
+    : null;
+  // Heal older workspaces with the fatter persona automatically, and keep
+  // Codex workspace notes in lockstep with the code.
+  if (currentAgentsFileContent !== expectedAgentsFileContent) {
+    writeFileSync(agentsFilePath, expectedAgentsFileContent);
+  }
+}
+
 export function readWorkspaceMetadata(workspaceId) {
   try {
     return JSON.parse(readFileSync(clickyMetadataPath(workspaceId), "utf8"));
@@ -101,16 +113,8 @@ export function createWorkspace(topicName) {
 
   mkdirSync(directoryPath, { recursive: true });
 
-  const agentsFilePath = join(directoryPath, "AGENTS.md");
   const expectedAgentsFileContent = COMPANION_WORKSPACE_NOTES + "\n";
-  const currentAgentsFileContent = existsSync(agentsFilePath)
-    ? readFileSync(agentsFilePath, "utf8")
-    : null;
-  // Heal older workspaces with the fatter persona automatically, and keep
-  // Codex workspace notes in lockstep with the code.
-  if (currentAgentsFileContent !== expectedAgentsFileContent) {
-    writeFileSync(agentsFilePath, expectedAgentsFileContent);
-  }
+  syncAgentsFileWithExpectedContent(directoryPath, expectedAgentsFileContent);
 
   if (!alreadyExisted) {
     updateWorkspaceMetadata(workspaceId, {
@@ -177,14 +181,8 @@ export function ensureChatWorkspaceExists() {
   const chatWorkspaceAlreadyExisted = existsSync(chatDirectoryPath);
   mkdirSync(chatDirectoryPath, { recursive: true });
 
-  const agentsFilePath = join(chatDirectoryPath, "AGENTS.md");
   const expectedAgentsFileContent = COMPANION_CHAT_NOTES + "\n";
-  const currentAgentsFileContent = existsSync(agentsFilePath)
-    ? readFileSync(agentsFilePath, "utf8")
-    : null;
-  if (currentAgentsFileContent !== expectedAgentsFileContent) {
-    writeFileSync(agentsFilePath, expectedAgentsFileContent);
-  }
+  syncAgentsFileWithExpectedContent(chatDirectoryPath, expectedAgentsFileContent);
 
   if (!chatWorkspaceAlreadyExisted) {
     updateWorkspaceMetadata(CHAT_WORKSPACE_ID, {

@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { chatModelForBackend } from "./chatModelForBackend.mjs";
 
 const sidecarDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const commandLineArguments = process.argv.slice(2);
@@ -61,10 +62,6 @@ function logProcessChunk(runName, chunk) {
 
 function newRequestId(runName, suffix) {
   return `${runName}-${suffix}-${Date.now()}`;
-}
-
-function chatModelForBackend(backend) {
-  return backend === "claude" ? "claude-sonnet-4-6" : "default";
 }
 
 class SidecarProcess {

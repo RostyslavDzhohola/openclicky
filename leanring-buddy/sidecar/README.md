@@ -81,6 +81,7 @@ Requests (stdin): `chat`, `oneShot`, `createWorkspace`, `listWorkspaces`,
 Events (stdout): `ready`, `status` (per-turn progress), `result`, `error`
 (codes: `auth_required`, `skill_install_failed`, `workspace_missing`,
 `cancelled`, `node_backend_crash`, `internal`), `lessonCreated`
-(with `openedByAgent` so exactly one browser tab opens), `log`.
+(with `openedByAgent` so exactly one browser tab opens), `teachError`
+(a dispatched background lesson failed — skill install or teach turn), `log`.
 
 Diagnostics go to stderr; stdout is protocol-only.
