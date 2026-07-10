@@ -19,6 +19,7 @@
     "drive:resume": "node test/drive.mjs resume",
     "drive:split": "node test/drive.mjs split",
     "drive:workspaces": "node test/drive.mjs workspaces",
+    "refresh-teach-template": "cd teach-template && npx -y skills@latest add mattpocock/skills --skill teach --agent claude-code --agent codex -y --copy",
     "clean": "rm -rf node_modules"
   },
   "dependencies": {
