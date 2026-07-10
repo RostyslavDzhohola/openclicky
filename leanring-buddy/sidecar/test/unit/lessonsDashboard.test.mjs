@@ -26,11 +26,13 @@ test("topics list every lesson as a relative link with the latest marked", () =>
   mkdirSync(lessonsDirectory, { recursive: true });
   writeFileSync(join(lessonsDirectory, "0001-hiragana.html"), "<html></html>");
   writeFileSync(join(lessonsDirectory, "0002-katakana.html"), "<html></html>");
+  writeFileSync(join(lessonsDirectory, "cancelled-0003-kanji.html"), "<html></html>");
 
   const dashboardHtml = readFileSync(regenerateLessonsDashboard(), "utf8");
   assert.ok(dashboardHtml.includes("Japanese"));
   assert.ok(dashboardHtml.includes('href="japanese/lessons/0001-hiragana.html"'));
   assert.ok(dashboardHtml.includes('href="japanese/lessons/0002-katakana.html"'));
+  assert.equal(dashboardHtml.includes("cancelled-0003-kanji.html"), false);
   // Latest lesson (highest number) carries the highlight class.
   const latestIndex = dashboardHtml.indexOf("0002-katakana.html");
   const highlightIndex = dashboardHtml.lastIndexOf('class="latest"', latestIndex);

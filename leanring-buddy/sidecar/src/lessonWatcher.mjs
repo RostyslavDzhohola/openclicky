@@ -14,6 +14,7 @@ import { recentCodexShellCommands } from "./codexBackend.mjs";
 import { workspacePath } from "./workspaces.mjs";
 import { regenerateLessonsDashboard } from "./lessonsDashboard.mjs";
 import { traceAgentEvent } from "./agentTrace.mjs";
+import { CANONICAL_LESSON_FILE_NAME_PATTERN } from "./teachDispatchRegistry.mjs";
 
 const LESSON_OPEN_GRACE_PERIOD_MS = 2_000;
 const TEACH_TURN_HOLD_SAFETY_TIMEOUT_MS = 15 * 60 * 1_000;
@@ -51,6 +52,10 @@ export function didAgentOpenLesson(shellCommands, lessonFileName) {
       return firstCommandToken === "open";
     });
   });
+}
+
+function isCanonicalLessonFilePath(lessonFilePath) {
+  return CANONICAL_LESSON_FILE_NAME_PATTERN.test(basename(lessonFilePath));
 }
 
 function truncatedCommandsForLog(shellCommands) {
@@ -198,6 +203,8 @@ export function createLessonEventCoordinator({
   }
 
   function handleStabilizedLessonAdd({ workspaceId, addedFilePath }) {
+    if (!isCanonicalLessonFilePath(addedFilePath)) return;
+
     const activeTeachTurnHold = activeTeachTurnHolds.get(workspaceId);
     emitTrace("lesson.detected", {
       ...activeTeachTurnHold?.correlation,
@@ -263,7 +270,7 @@ export function watchWorkspaceLessons(workspaceId, backend) {
   });
 
   watcher.on("add", (addedFilePath) => {
-    if (!addedFilePath.endsWith(".html")) return;
+    if (!isCanonicalLessonFilePath(addedFilePath)) return;
     if (!addedFilePath.includes(`${sep}lessons${sep}`)) return;
     lessonEventCoordinator.handleStabilizedLessonAdd({ workspaceId, addedFilePath });
   });

@@ -2,10 +2,10 @@
 // Keeping this state machine independent from index.mjs makes cancellation
 // ordering and file cleanup testable without starting either AI backend.
 
-import { readdirSync, unlinkSync } from "node:fs";
+import { existsSync, readdirSync, renameSync } from "node:fs";
 import { join } from "node:path";
 
-const LESSON_FILE_NAME_PATTERN = /^(\d{4})-.*\.html$/i;
+export const CANONICAL_LESSON_FILE_NAME_PATTERN = /^(\d{4})-.*\.html$/;
 
 export function createTeachDispatchRegistry() {
   const activeDispatchesByWorkspaceId = new Map();
@@ -78,7 +78,7 @@ export function listLessonFileNames(lessonsDirectory) {
     return readdirSync(lessonsDirectory, { withFileTypes: true })
       .filter(
         (directoryEntry) =>
-          directoryEntry.isFile() && LESSON_FILE_NAME_PATTERN.test(directoryEntry.name)
+          directoryEntry.isFile() && CANONICAL_LESSON_FILE_NAME_PATTERN.test(directoryEntry.name)
       )
       .map((directoryEntry) => directoryEntry.name)
       .sort();
@@ -90,24 +90,33 @@ export function listLessonFileNames(lessonsDirectory) {
   }
 }
 
-export function removeLessonFilesCreatedDuringDispatch({
+export function quarantineLessonFilesCreatedDuringDispatch({
   lessonsDirectory,
   lessonFileNamesBeforeDispatch,
 }) {
   const lessonFileNamesBeforeDispatchSet = new Set(lessonFileNamesBeforeDispatch);
   const lessonFileNamesAfterDispatch = listLessonFileNames(lessonsDirectory);
-  const removedLessonFileNames = [];
+  const quarantinedLessonFileNames = [];
 
   for (const lessonFileName of lessonFileNamesAfterDispatch) {
     if (lessonFileNamesBeforeDispatchSet.has(lessonFileName)) {
       continue;
     }
 
-    // lessonFileName came directly from a non-recursive directory listing and
-    // passed the lesson pattern, so cleanup cannot escape or traverse folders.
-    unlinkSync(join(lessonsDirectory, lessonFileName));
-    removedLessonFileNames.push(lessonFileName);
+    let quarantinedLessonFileName = `cancelled-${lessonFileName}`;
+    let quarantineCollisionNumber = 2;
+    while (existsSync(join(lessonsDirectory, quarantinedLessonFileName))) {
+      quarantinedLessonFileName = `cancelled-${quarantineCollisionNumber}-${lessonFileName}`;
+      quarantineCollisionNumber += 1;
+    }
+    // Renaming in place keeps potentially concurrent work recoverable while
+    // removing it from every feature that recognizes canonical lesson names.
+    renameSync(
+      join(lessonsDirectory, lessonFileName),
+      join(lessonsDirectory, quarantinedLessonFileName)
+    );
+    quarantinedLessonFileNames.push(quarantinedLessonFileName);
   }
 
-  return removedLessonFileNames;
+  return quarantinedLessonFileNames;
 }

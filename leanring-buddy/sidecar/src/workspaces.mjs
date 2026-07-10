@@ -25,6 +25,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { COMPANION_CHAT_NOTES, COMPANION_WORKSPACE_NOTES } from "./companionRules.mjs";
 import { emitLog } from "./protocol.mjs";
+import { CANONICAL_LESSON_FILE_NAME_PATTERN } from "./teachDispatchRegistry.mjs";
 
 export const GENERAL_WORKSPACE_ID = "general";
 export const CHAT_WORKSPACE_ID = ".chat";
@@ -134,7 +135,7 @@ export function describeWorkspace(workspaceId) {
   let lessonCount = 0;
   if (existsSync(lessonsDirectory)) {
     lessonCount = readdirSync(lessonsDirectory).filter((fileName) =>
-      fileName.endsWith(".html")
+      CANONICAL_LESSON_FILE_NAME_PATTERN.test(fileName)
     ).length;
   }
   return {

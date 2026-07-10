@@ -13,6 +13,7 @@ import {
   listWorkspaces,
   workspacePath,
 } from "./workspaces.mjs";
+import { CANONICAL_LESSON_FILE_NAME_PATTERN } from "./teachDispatchRegistry.mjs";
 
 export function lessonsDashboardPath() {
   return join(lessonsRootDirectory(), "index.html");
@@ -31,7 +32,7 @@ function lessonFileNamesForTopic(workspaceId) {
   const lessonsDirectory = join(workspacePath(workspaceId), "lessons");
   if (!existsSync(lessonsDirectory)) return [];
   return readdirSync(lessonsDirectory)
-    .filter((fileName) => fileName.endsWith(".html"))
+    .filter((fileName) => CANONICAL_LESSON_FILE_NAME_PATTERN.test(fileName))
     .sort();
 }
 

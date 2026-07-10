@@ -107,6 +107,19 @@ test("unheld lesson additions use commands available when the grace period ends"
   assert.match(harness.logs[0].message, /held=false/);
 });
 
+test("quarantined lesson additions never produce lesson events", async () => {
+  const harness = createCoordinatorHarness();
+
+  harness.coordinator.handleStabilizedLessonAdd({
+    workspaceId: "css",
+    addedFilePath: "/lessons/css/lessons/cancelled-0001-selectors.html",
+  });
+  await waitForTimer(30);
+
+  assert.deepEqual(harness.emittedLessonEvents, []);
+  assert.equal(harness.dashboardRegenerationCount, 0);
+});
+
 test("held lessons use commands recorded after the add and before the turn flushes", () => {
   const harness = createCoordinatorHarness();
   harness.coordinator.beginTeachTurnHold("css", "claude", {

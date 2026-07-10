@@ -69,7 +69,7 @@ final class CompanionManager: ObservableObject {
 
     /// Lesson builds currently running in the sidecar (workspaceId → build info).
     /// Non-empty makes the panel show a "building your lesson" row; entries clear
-    /// on lessonCreated / teachBuildCancelled / teachError, with a 30-minute
+    /// on lessonCreated / teachBuildCompleted / teachBuildCancelled / teachError, with a 30-minute
     /// staleness fallback in case the sidecar dies before a terminal event arrives.
     @Published private(set) var lessonBuildsInProgress: [String: LessonBuildInProgress] = [:]
 
@@ -430,13 +430,15 @@ final class CompanionManager: ObservableObject {
         bindShortcutTransitions()
         ScreenshotFileStore.sweepStaleCaptures()
 
-        // Clicky owns the completion action: topic agents are instructed never
-        // to open lessons, so every completed lesson event deterministically
-        // opens exactly once from the app.
+        // Clicky opens each lesson unless the completed turn's shell commands
+        // show the agent already did, so openedByAgent deduplication produces
+        // exactly one browser tab either way.
         sidecarManager.onLessonCreated = { [weak self] lesson in
             guard let self else { return }
             self.lessonBuildsInProgress.removeValue(forKey: lesson.workspaceId)
-            NSWorkspace.shared.open(URL(fileURLWithPath: lesson.path))
+            if lesson.openedByAgent == false {
+                NSWorkspace.shared.open(URL(fileURLWithPath: lesson.path))
+            }
             // A new lesson just landed on disk — refresh the picker so it appears
             // in the panel without waiting for the panel to be reopened.
             self.refreshLessonTopicListings()
@@ -484,6 +486,11 @@ final class CompanionManager: ObservableObject {
         }
 
         sidecarManager.onTeachBuildCancelled = { [weak self] workspaceId in
+            guard let self else { return }
+            self.lessonBuildsInProgress.removeValue(forKey: workspaceId)
+        }
+
+        sidecarManager.onTeachBuildCompleted = { [weak self] workspaceId in
             guard let self else { return }
             self.lessonBuildsInProgress.removeValue(forKey: workspaceId)
         }

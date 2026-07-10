@@ -37,7 +37,7 @@ const { parseOpenTag, resolveOpenLessonPath } = await import("./src/openTag.mjs"
 const {
   createTeachDispatchRegistry,
   listLessonFileNames,
-  removeLessonFilesCreatedDuringDispatch,
+  quarantineLessonFilesCreatedDuringDispatch,
 } = await import("./src/teachDispatchRegistry.mjs");
 const {
   INTERVIEW_PREAMBLE,
@@ -95,7 +95,9 @@ const cancelledChatRequestIds = new Set();
 const teachDispatchRegistry = createTeachDispatchRegistry();
 
 function handleOpenLessonRequest(openRequest, correlation = {}) {
-  if (!openRequest) return;
+  if (!openRequest) {
+    return { opened: false, failureSpokenText: null };
+  }
 
   const resolution = resolveOpenLessonPath({
     lessonsRootDirectory: lessonsRootDirectory(),
@@ -113,10 +115,10 @@ function handleOpenLessonRequest(openRequest, correlation = {}) {
       "info",
       `open lesson failed slug=${openRequest.topicSlug} ordinal=${openRequest.lessonOrdinal ?? "latest"} reason=${resolution.failureReason}`
     );
-    const text = "hmm, i couldn't find that lesson.";
-    traceAgentEvent("response.emitted", { ...correlation, channel: "speak", text });
-    emitEvent({ type: "speak", text, ...correlation });
-    return;
+    return {
+      opened: false,
+      failureSpokenText: "hmm, actually i couldn't find that lesson to open.",
+    };
   }
 
   traceAgentEvent("open.requested", {
@@ -144,6 +146,17 @@ function handleOpenLessonRequest(openRequest, correlation = {}) {
     emitEvent({ type: "speak", text, ...correlation });
   });
   openProcess.unref();
+  return { opened: true, failureSpokenText: null };
+}
+
+function appendOpenLessonFailureToSpokenReply(spokenReplyText, openLessonOutcome) {
+  if (!openLessonOutcome?.failureSpokenText) {
+    return spokenReplyText;
+  }
+
+  return [spokenReplyText.trim(), openLessonOutcome.failureSpokenText]
+    .filter((spokenReplyPart) => spokenReplyPart.length > 0)
+    .join(" ");
 }
 
 function parseChatResponseTags(responseText) {
@@ -292,8 +305,8 @@ async function prepareTeachWorkspace({
 /**
  * Builds a lesson in the topic's persistent teach session, in the background.
  * The chat result has already been emitted — failures surface as a dedicated
- * teachError event the app speaks, and success surfaces as the existing
- * lessonCreated event from the watcher.
+ * teachError event the app speaks. Successful builds always emit
+ * teachBuildCompleted, while new lessons also surface through lessonCreated.
  */
 async function dispatchTeachInstructions({
   backend,
@@ -355,10 +368,10 @@ async function dispatchTeachInstructions({
 
   function finishCancelledDispatch() {
     dispatchWasCancelled = true;
-    let removedLessonFileNames = [];
+    let quarantinedLessonFileNames = [];
     if (workspace) {
       try {
-        removedLessonFileNames = removeLessonFilesCreatedDuringDispatch({
+        quarantinedLessonFileNames = quarantineLessonFilesCreatedDuringDispatch({
           lessonsDirectory: join(workspace.path, "lessons"),
           lessonFileNamesBeforeDispatch,
         });
@@ -372,14 +385,14 @@ async function dispatchTeachInstructions({
         endTeachTurnHold(workspace.id, { discardQueuedLessons: true });
         teachTurnHoldStarted = false;
       }
-      if (removedLessonFileNames.length > 0) {
+      if (quarantinedLessonFileNames.length > 0) {
         regenerateLessonsDashboard();
       }
     }
 
     emitLog(
       "info",
-      `teach dispatch cancelled workspace=${workspace?.id ?? workspaceIdForTopic} removedLessonFiles=${JSON.stringify(removedLessonFileNames)}`
+      `teach dispatch cancelled workspace=${workspace?.id ?? workspaceIdForTopic} quarantinedLessonFiles=${JSON.stringify(quarantinedLessonFileNames)}`
     );
     traceAgentEvent("agent.cancelled", {
       ...correlation,
@@ -488,6 +501,12 @@ async function dispatchTeachInstructions({
     if (createdLessonFileNames.length > 0) {
       spokenWrapUpText = buildLessonCompletionAnnouncement(topicText);
     }
+    emitEvent({
+      type: "teachBuildCompleted",
+      workspaceId: workspace.id,
+      topicName: topicText,
+      ...correlation,
+    });
   } catch (dispatchError) {
     if (
       dispatchError?.clickyErrorCode === "cancelled" ||
@@ -746,7 +765,7 @@ async function handleChatRequest(request) {
         emitLog("warn", `ignoring leaked teach tag from interview workspace ${activeInterview.workspaceId}`);
       }
       await handleCancelLessonBuildRequest(cancelRequest);
-      handleOpenLessonRequest(openRequest, baseCorrelation);
+      const openLessonOutcome = handleOpenLessonRequest(openRequest, baseCorrelation);
 
       const interviewConclusion = concludeInterviewIfMissionCaptured();
       if (!interviewConclusion.missionCaptured) {
@@ -760,7 +779,10 @@ async function handleChatRequest(request) {
           armInterviewExpiry();
         }
       }
-      let spokenReplyText = cleanedText;
+      let spokenReplyText = appendOpenLessonFailureToSpokenReply(
+        cleanedText,
+        openLessonOutcome
+      );
       if (interviewConclusion.buildDispatched) {
         // The teach session's own wrap-up ("your course is set up") says nothing
         // about the multi-minute build that follows — set that expectation now.
@@ -860,7 +882,11 @@ async function handleChatRequest(request) {
         openTopic: openRequest?.topicSlug,
       });
       await handleCancelLessonBuildRequest(cancelRequest);
-      handleOpenLessonRequest(openRequest, baseCorrelation);
+      const openLessonOutcome = handleOpenLessonRequest(openRequest, baseCorrelation);
+      responseText = appendOpenLessonFailureToSpokenReply(
+        responseText,
+        openLessonOutcome
+      );
       if (teachDispatch) {
         const topicWorkspaceDirectory = workspacePath(slugifyTopicName(teachDispatch.topicText));
         if (missionFileExists(topicWorkspaceDirectory)) {
@@ -961,7 +987,14 @@ async function handleChatRequest(request) {
       const finalOpenTagResult = parseOpenTag(finalCancelTagResult.cleanedText);
       responseText = finalOpenTagResult.cleanedText;
       await handleCancelLessonBuildRequest(finalCancelTagResult.cancelRequest);
-      handleOpenLessonRequest(finalOpenTagResult.openRequest, baseCorrelation);
+      const finalOpenLessonOutcome = handleOpenLessonRequest(
+        finalOpenTagResult.openRequest,
+        baseCorrelation
+      );
+      responseText = appendOpenLessonFailureToSpokenReply(
+        responseText,
+        finalOpenLessonOutcome
+      );
     }
 
     traceAgentEvent("response.emitted", {

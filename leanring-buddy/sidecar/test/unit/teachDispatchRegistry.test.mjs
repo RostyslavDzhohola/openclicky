@@ -12,7 +12,7 @@ import { join } from "node:path";
 import {
   createTeachDispatchRegistry,
   listLessonFileNames,
-  removeLessonFilesCreatedDuringDispatch,
+  quarantineLessonFilesCreatedDuringDispatch,
 } from "../../src/teachDispatchRegistry.mjs";
 
 function createDispatchArguments(requestId = "teach-dispatch-one") {
@@ -149,7 +149,7 @@ function createLessonsSandbox() {
   return { sandboxDirectory, lessonsDirectory };
 }
 
-test("lesson cleanup removes only new matching files directly inside the lessons directory", () => {
+test("lesson cleanup quarantines only new matching files directly inside the lessons directory", () => {
   const { lessonsDirectory } = createLessonsSandbox();
   writeFileSync(join(lessonsDirectory, "0001-existing.html"), "existing lesson");
   writeFileSync(join(lessonsDirectory, "notes.txt"), "notes");
@@ -158,17 +158,21 @@ test("lesson cleanup removes only new matching files directly inside the lessons
   writeFileSync(join(nestedDirectory, "0003-nested.html"), "nested lesson");
 
   const lessonFileNamesBeforeDispatch = listLessonFileNames(lessonsDirectory);
-  writeFileSync(join(lessonsDirectory, "0002-new.HTML"), "new lesson");
+  writeFileSync(join(lessonsDirectory, "0002-new.html"), "new lesson");
   writeFileSync(join(lessonsDirectory, "draft.html"), "non-lesson html");
 
-  const removedFileNames = removeLessonFilesCreatedDuringDispatch({
+  const quarantinedFileNames = quarantineLessonFilesCreatedDuringDispatch({
     lessonsDirectory,
     lessonFileNamesBeforeDispatch,
   });
 
   assert.deepEqual(lessonFileNamesBeforeDispatch, ["0001-existing.html"]);
-  assert.deepEqual(removedFileNames, ["0002-new.HTML"]);
+  assert.deepEqual(quarantinedFileNames, ["cancelled-0002-new.html"]);
   assert.equal(readFileSync(join(lessonsDirectory, "0001-existing.html"), "utf8"), "existing lesson");
+  assert.equal(
+    readFileSync(join(lessonsDirectory, "cancelled-0002-new.html"), "utf8"),
+    "new lesson"
+  );
   assert.equal(readFileSync(join(lessonsDirectory, "notes.txt"), "utf8"), "notes");
   assert.equal(readFileSync(join(lessonsDirectory, "draft.html"), "utf8"), "non-lesson html");
   assert.equal(readFileSync(join(nestedDirectory, "0003-nested.html"), "utf8"), "nested lesson");
@@ -180,10 +184,34 @@ test("lesson filesystem helpers tolerate a missing lessons directory", () => {
 
   assert.deepEqual(listLessonFileNames(missingLessonsDirectory), []);
   assert.deepEqual(
-    removeLessonFilesCreatedDuringDispatch({
+    quarantineLessonFilesCreatedDuringDispatch({
       lessonsDirectory: missingLessonsDirectory,
       lessonFileNamesBeforeDispatch: [],
     }),
     []
+  );
+});
+
+test("lesson quarantine preserves an existing recovery copy with the same file name", () => {
+  const { lessonsDirectory } = createLessonsSandbox();
+  writeFileSync(
+    join(lessonsDirectory, "cancelled-0002-layout.html"),
+    "previously quarantined lesson"
+  );
+  writeFileSync(join(lessonsDirectory, "0002-layout.html"), "newly cancelled lesson");
+
+  const quarantinedFileNames = quarantineLessonFilesCreatedDuringDispatch({
+    lessonsDirectory,
+    lessonFileNamesBeforeDispatch: [],
+  });
+
+  assert.deepEqual(quarantinedFileNames, ["cancelled-2-0002-layout.html"]);
+  assert.equal(
+    readFileSync(join(lessonsDirectory, "cancelled-0002-layout.html"), "utf8"),
+    "previously quarantined lesson"
+  );
+  assert.equal(
+    readFileSync(join(lessonsDirectory, "cancelled-2-0002-layout.html"), "utf8"),
+    "newly cancelled lesson"
   );
 });

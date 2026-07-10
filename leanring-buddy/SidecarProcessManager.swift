@@ -154,8 +154,9 @@ final class SidecarProcessManager: ObservableObject {
     var onSpeakText: (((text: String, traceId: String?)) -> Void)?
 
     /// Fired when a background lesson build begins; paired with lessonCreated,
-    /// teachBuildCancelled, or teachError so the UI can show a persistent indicator.
+    /// teachBuildCompleted, teachBuildCancelled, or teachError so the UI can show a persistent indicator.
     var onTeachBuildStarted: (((workspaceId: String, topicName: String)) -> Void)?
+    var onTeachBuildCompleted: ((String) -> Void)?
     var onTeachBuildCancelled: ((String) -> Void)?
 
     private let userDefaults = UserDefaults.standard
@@ -790,6 +791,11 @@ final class SidecarProcessManager: ObservableObject {
         case "teachBuildCancelled":
             if let workspaceId = event.workspaceId {
                 onTeachBuildCancelled?(workspaceId)
+            }
+
+        case "teachBuildCompleted":
+            if let workspaceId = event.workspaceId {
+                onTeachBuildCompleted?(workspaceId)
             }
 
         case "teachError":
