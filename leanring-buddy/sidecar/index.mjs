@@ -23,10 +23,20 @@ const {
   listWorkspaces,
   lessonsRootDirectory,
   workspaceExists,
+  workspacePath,
+  slugifyTopicName,
   CHAT_WORKSPACE_ID,
   GENERAL_WORKSPACE_ID,
 } = await import("./src/workspaces.mjs");
 const { parseTeachTag } = await import("./src/teachTag.mjs");
+const {
+  INTERVIEW_PREAMBLE,
+  LESSON_GROUNDING_NOTE,
+  POST_INTERVIEW_BUILD_INSTRUCTIONS,
+  INTERVIEW_WRAP_UP_NOTE,
+  missionFileExists,
+  createInterviewTracker,
+} = await import("./src/teachInterview.mjs");
 const { buildTopicRosterText, composeChatTurnText } = await import("./src/topicRoster.mjs");
 const { regenerateLessonsDashboard, lessonsDashboardPath } = await import(
   "./src/lessonsDashboard.mjs"
@@ -56,6 +66,9 @@ const SIDECAR_VERSION = "1.0.0";
 
 const CHAT_IDLE_RESET_MS = Number(process.env.CLICKY_CHAT_IDLE_MS ?? 600_000);
 let chatIdleResetTimer = null;
+const interviewTracker = createInterviewTracker();
+const INTERVIEW_IDLE_EXPIRY_MS = Number(process.env.CLICKY_INTERVIEW_IDLE_MS ?? 600_000);
+let interviewExpiryTimer = null;
 
 function armChatIdleReset() {
   clearTimeout(chatIdleResetTimer);
@@ -70,6 +83,45 @@ function armChatIdleReset() {
   }, CHAT_IDLE_RESET_MS);
   // Never keep the process alive just for the reset timer.
   chatIdleResetTimer.unref?.();
+}
+
+function clearInterviewExpiryTimer() {
+  clearTimeout(interviewExpiryTimer);
+  interviewExpiryTimer = null;
+}
+
+function armInterviewExpiry() {
+  clearInterviewExpiryTimer();
+  interviewExpiryTimer = setTimeout(() => {
+    const activeInterview = interviewTracker.activeInterview;
+    if (activeInterview) {
+      emitLog(
+        "info",
+        `interview idle window elapsed — abandoning the mission interview for ${activeInterview.workspaceId}`
+      );
+      interviewTracker.expire();
+    }
+    interviewExpiryTimer = null;
+  }, INTERVIEW_IDLE_EXPIRY_MS);
+  // Never keep the process alive just for the interview expiry timer.
+  interviewExpiryTimer.unref?.();
+}
+
+async function prepareTeachWorkspace({ topicText, backend }) {
+  const workspace = createWorkspace(topicText);
+  const teachInstall = await ensureTeachSkillInstalled(workspace.path);
+  if (!teachInstall.installed) {
+    emitEvent({
+      type: "teachError",
+      workspaceId: workspace.id,
+      topicName: topicText,
+      message: teachInstall.message,
+    });
+    return null;
+  }
+  regenerateLessonsDashboard();
+  watchWorkspaceLessons(workspace.id, backend);
+  return workspace;
 }
 
 /**
@@ -91,14 +143,8 @@ async function dispatchTeachInstructions({ backend, model, topicText, instructio
 
   let workspace;
   try {
-    workspace = createWorkspace(topicText);
-    const teachInstall = await ensureTeachSkillInstalled(workspace.path);
-    if (!teachInstall.installed) {
-      emitEvent({ type: "teachError", workspaceId: workspace.id, topicName: topicText, message: teachInstall.message });
-      return;
-    }
-    regenerateLessonsDashboard();
-    watchWorkspaceLessons(workspace.id, backend);
+    workspace = await prepareTeachWorkspace({ topicText, backend });
+    if (!workspace) return;
 
     // Lesson quality beats latency: dispatched teach turns always run at a
     // deep reasoning tier regardless of the panel's thinking setting — codex
@@ -106,10 +152,7 @@ async function dispatchTeachInstructions({ backend, model, topicText, instructio
     // for lesson work). The chat plane keeps the user's own configuration.
     const lessonEffortLevel = backend === "codex" ? "xhigh" : "high";
 
-    const groundedInstructions =
-      instructions +
-      "\n\nbefore writing the lesson, use web search to ground your understanding of this topic in current, accurate information — verify key facts and examples rather than relying on memory." +
-      "\n\nin any quiz, randomize which option position holds the correct answer, and keep all options the same length and word count so formatting gives no clues.";
+    const groundedInstructions = instructions + LESSON_GROUNDING_NOTE;
 
     const dispatchArguments = {
       requestId,
@@ -123,7 +166,7 @@ async function dispatchTeachInstructions({ backend, model, topicText, instructio
     };
     emitLog(
       "info",
-      `teach dispatch → ${backend} model=${model ?? "default"} effort=${lessonEffortLevel} workspace=${workspace.id}`
+      `teach dispatch → ${backend} model=${model ?? "default"} effort=${lessonEffortLevel} workspace=${workspace.id} instructions="${String(instructions).slice(0, 300).replace(/\r?\n/g, " ")}"`
     );
     let turnResult;
     if (backend === "codex") {
@@ -146,6 +189,53 @@ async function dispatchTeachInstructions({ backend, model, topicText, instructio
   }
 }
 
+async function startInterview({ backend, model, effort, topicText, instructions, requestId, onStatus }) {
+  const workspace = await prepareTeachWorkspace({ topicText, backend });
+  if (!workspace) return null;
+
+  const interviewTurnArguments = {
+    requestId,
+    workspaceId: workspace.id,
+    model,
+    effort,
+    text: instructions + "\n\n" + INTERVIEW_PREAMBLE,
+    images: [],
+    teachIntent: true,
+    onStatus,
+  };
+
+  // Interview turns are intentionally not durable: after a crash, a missing
+  // MISSION.md safely causes the next teach request to begin again.
+  const turnResult =
+    backend === "codex"
+      ? await runCodexChatTurn(interviewTurnArguments)
+      : await runClaudeChatTurn(interviewTurnArguments);
+
+  return { workspace, replyText: turnResult.text };
+}
+
+function concludeInterviewIfMissionCaptured() {
+  const activeInterview = interviewTracker.activeInterview;
+  if (!activeInterview) return false;
+  if (!missionFileExists(workspacePath(activeInterview.workspaceId))) return false;
+
+  clearInterviewExpiryTimer();
+  const completedInterview = interviewTracker.complete();
+  emitLog("info", `mission captured for ${completedInterview.workspaceId} — concluding interview`);
+  if (describeWorkspace(completedInterview.workspaceId).lessonCount > 0) {
+    emitLog("info", "lesson already created during the interview — skipping build dispatch");
+    return true;
+  }
+
+  void dispatchTeachInstructions({
+    backend: completedInterview.backend,
+    model: completedInterview.model,
+    topicText: completedInterview.topicText,
+    instructions: POST_INTERVIEW_BUILD_INSTRUCTIONS,
+  });
+  return true;
+}
+
 async function handleChatRequest(request) {
   // The chat plane owns every voice turn. An explicit non-general workspaceId
   // is the legacy direct path, kept for the terminal drive harness.
@@ -153,16 +243,70 @@ async function handleChatRequest(request) {
     !request.workspaceId || request.workspaceId === GENERAL_WORKSPACE_ID;
   const workspaceId = isChatPlaneTurn ? CHAT_WORKSPACE_ID : request.workspaceId;
 
+  const onStatus = (statusUpdate) => {
+    emitEvent({ id: request.id, type: "status", ...statusUpdate });
+  };
+
+  const activeInterview = interviewTracker.activeInterview;
+  if (isChatPlaneTurn && activeInterview) {
+    // While a mission interview is active, voice turns stay in the topic's
+    // teach session just as they would for a CLI user answering its questions.
+    clearTimeout(chatIdleResetTimer);
+    clearInterviewExpiryTimer();
+    const { reachedTurnCap } = interviewTracker.recordRoutedTurn();
+    const routedText =
+      (request.text ?? "") + (reachedTurnCap ? INTERVIEW_WRAP_UP_NOTE : "");
+    const routedTurnArguments = {
+      requestId: request.id,
+      workspaceId: activeInterview.workspaceId,
+      model: activeInterview.model,
+      effort: request.effort,
+      text: routedText,
+      images: request.images ?? [],
+      teachIntent: false,
+      onStatus,
+    };
+
+    // Keep the original backend so the topic session remains continuous if
+    // the user changes the panel's backend while answering the interview.
+    watchWorkspaceLessons(activeInterview.workspaceId, activeInterview.backend);
+
+    try {
+      const turnResult =
+        activeInterview.backend === "codex"
+          ? await runCodexChatTurn(routedTurnArguments)
+          : await runClaudeChatTurn(routedTurnArguments);
+      const { cleanedText, dispatch } = parseTeachTag(turnResult.text);
+      if (dispatch) {
+        emitLog("warn", `ignoring leaked teach tag from interview workspace ${activeInterview.workspaceId}`);
+      }
+
+      if (!concludeInterviewIfMissionCaptured()) {
+        armInterviewExpiry();
+      }
+      emitEvent({
+        id: request.id,
+        type: "result",
+        text: cleanedText,
+        sessionId: turnResult.sessionId ?? null,
+        durationMs: turnResult.durationMs ?? null,
+      });
+    } finally {
+      // A failed or cancelled routed turn still ends chat-plane activity.
+      armChatIdleReset();
+      if (interviewTracker.activeInterview) {
+        armInterviewExpiry();
+      }
+    }
+    return;
+  }
+
   if (!isChatPlaneTurn && !workspaceExists(workspaceId)) {
     emitError(request.id, "workspace_missing", `workspace "${workspaceId}" does not exist`);
     return;
   }
 
   watchWorkspaceLessons(workspaceId, request.backend);
-
-  const onStatus = (statusUpdate) => {
-    emitEvent({ id: request.id, type: "status", ...statusUpdate });
-  };
 
   let turnText = request.text ?? "";
   if (isChatPlaneTurn) {
@@ -200,13 +344,58 @@ async function handleChatRequest(request) {
       const { cleanedText, dispatch } = parseTeachTag(responseText);
       responseText = cleanedText;
       if (dispatch) {
-        // Fire-and-forget: a minutes-long lesson build never blocks the chat.
-        void dispatchTeachInstructions({
-          backend: request.backend,
-          model: request.model,
-          topicText: dispatch.topicText,
-          instructions: dispatch.instructions,
-        });
+        const topicWorkspaceDirectory = workspacePath(slugifyTopicName(dispatch.topicText));
+        if (missionFileExists(topicWorkspaceDirectory)) {
+          // Mission already captured: a minutes-long lesson build never blocks the chat.
+          void dispatchTeachInstructions({
+            backend: request.backend,
+            model: request.model,
+            topicText: dispatch.topicText,
+            instructions: dispatch.instructions,
+          });
+        } else {
+          // No mission yet: run the teach skill's own mission interview over voice.
+          try {
+            const interviewStart = await startInterview({
+              backend: request.backend,
+              model: request.model,
+              effort: request.effort,
+              topicText: dispatch.topicText,
+              instructions: dispatch.instructions,
+              requestId: request.id,
+              onStatus,
+            });
+            if (interviewStart) {
+              const interviewReplyText = (interviewStart.replyText ?? "").trim();
+              responseText = [responseText, interviewReplyText]
+                .filter((part) => part.length > 0)
+                .join(" ");
+              interviewTracker.begin({
+                workspaceId: interviewStart.workspace.id,
+                backend: request.backend,
+                model: request.model,
+                topicText: dispatch.topicText,
+              });
+              // The model may capture the mission on the first turn if the
+              // tag's instructions already include enough user context.
+              if (!concludeInterviewIfMissionCaptured()) {
+                armInterviewExpiry();
+              }
+            }
+          } catch (interviewError) {
+            // A cancelled interview turn is a cancelled chat request, not a
+            // teach failure — let the standard cancelled error path handle it.
+            if (interviewError?.clickyErrorCode === "cancelled") {
+              throw interviewError;
+            }
+            emitEvent({
+              type: "teachError",
+              workspaceId: slugifyTopicName(dispatch.topicText),
+              topicName: dispatch.topicText,
+              message: String(interviewError?.message ?? interviewError),
+            });
+          }
+        }
       }
     }
 
