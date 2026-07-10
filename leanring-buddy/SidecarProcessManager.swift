@@ -263,7 +263,11 @@ final class SidecarProcessManager: ObservableObject {
         guard let text = event.text else {
             throw SidecarRequestError(code: "internal", message: "Chat result did not include text", backend: backend)
         }
-        return CompanionBrainResponse(turnId: requestId, text: text)
+        return CompanionBrainResponse(
+            traceId: event.traceId ?? requestId,
+            turnId: requestId,
+            text: text
+        )
     }
 
     func sendOneShot(
@@ -356,14 +360,19 @@ final class SidecarProcessManager: ObservableObject {
         ])
     }
 
-    func tracePresentation(event: String, turnId: String, fields: [String: Any] = [:]) {
+    func tracePresentation(
+        event: String,
+        traceId: String,
+        turnId: String,
+        fields: [String: Any] = [:]
+    ) {
         #if DEBUG
         guard sidecarProcess?.isRunning == true else { return }
         var payload = fields
         payload["id"] = UUID().uuidString
         payload["type"] = "agentTrace"
         payload["event"] = event
-        payload["traceId"] = turnId
+        payload["traceId"] = traceId
         payload["turnId"] = turnId
         payload["agentRole"] = "chat"
         writeFireAndForgetRequest(payload)

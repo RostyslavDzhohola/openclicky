@@ -13,6 +13,7 @@ enum BrainStatus {
 }
 
 struct CompanionBrainResponse {
+    let traceId: String
     let turnId: String
     let text: String
 }

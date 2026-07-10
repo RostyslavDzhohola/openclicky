@@ -508,18 +508,20 @@ final class CompanionManager: ObservableObject {
             if let traceId = spokenEvent.traceId {
                 self.sidecarManager.tracePresentation(
                     event: "presentation.displayed",
+                    traceId: traceId,
                     turnId: traceId,
                     fields: ["text": spokenLine]
                 )
             }
             Task { @MainActor in
                 let traceGeneration = spokenEvent.traceId.map {
-                    self.prepareTTSTrace(turnId: $0, spokenText: spokenLine)
+                    self.prepareTTSTrace(traceId: $0, turnId: $0, spokenText: spokenLine)
                 }
                 do {
                     try await self.textToSpeechClient.speakText(spokenLine)
                     if let traceId = spokenEvent.traceId, let traceGeneration {
                         self.markTTSPlaybackStartedAndMonitorCompletion(
+                            traceId: traceId,
                             turnId: traceId,
                             traceGeneration: traceGeneration
                         )
@@ -529,6 +531,7 @@ final class CompanionManager: ObservableObject {
                         self.activeTTSTraceGeneration = nil
                         self.sidecarManager.tracePresentation(
                             event: "tts.failed",
+                            traceId: traceId,
                             turnId: traceId,
                             fields: ["message": error.localizedDescription]
                         )
@@ -898,6 +901,7 @@ final class CompanionManager: ObservableObject {
                 }
                 sidecarManager.tracePresentation(
                     event: "presentation.prepared",
+                    traceId: brainResponse.traceId,
                     turnId: brainResponse.turnId,
                     fields: presentationTraceFields
                 )
@@ -965,16 +969,19 @@ final class CompanionManager: ObservableObject {
                     displaySpokenTextBubble(spokenText)
                     sidecarManager.tracePresentation(
                         event: "presentation.displayed",
+                        traceId: brainResponse.traceId,
                         turnId: brainResponse.turnId,
                         fields: ["text": spokenText]
                     )
                     do {
                         let traceGeneration = prepareTTSTrace(
+                            traceId: brainResponse.traceId,
                             turnId: brainResponse.turnId,
                             spokenText: spokenText
                         )
                         try await textToSpeechClient.speakText(spokenText)
                         markTTSPlaybackStartedAndMonitorCompletion(
+                            traceId: brainResponse.traceId,
                             turnId: brainResponse.turnId,
                             traceGeneration: traceGeneration
                         )
@@ -984,6 +991,7 @@ final class CompanionManager: ObservableObject {
                         activeTTSTraceGeneration = nil
                         sidecarManager.tracePresentation(
                             event: "tts.failed",
+                            traceId: brainResponse.traceId,
                             turnId: brainResponse.turnId,
                             fields: ["message": error.localizedDescription]
                         )
@@ -1054,11 +1062,12 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    private func prepareTTSTrace(turnId: String, spokenText: String) -> UUID {
+    private func prepareTTSTrace(traceId: String, turnId: String, spokenText: String) -> UUID {
         let traceGeneration = UUID()
         activeTTSTraceGeneration = traceGeneration
         sidecarManager.tracePresentation(
             event: "tts.requested",
+            traceId: traceId,
             turnId: turnId,
             fields: ["text": spokenText]
         )
@@ -1066,11 +1075,12 @@ final class CompanionManager: ObservableObject {
     }
 
     private func markTTSPlaybackStartedAndMonitorCompletion(
+        traceId: String,
         turnId: String,
         traceGeneration: UUID
     ) {
         guard activeTTSTraceGeneration == traceGeneration else { return }
-        sidecarManager.tracePresentation(event: "tts.started", turnId: turnId)
+        sidecarManager.tracePresentation(event: "tts.started", traceId: traceId, turnId: turnId)
 
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -1080,7 +1090,7 @@ final class CompanionManager: ObservableObject {
             }
             guard self.activeTTSTraceGeneration == traceGeneration else { return }
             self.activeTTSTraceGeneration = nil
-            self.sidecarManager.tracePresentation(event: "tts.completed", turnId: turnId)
+            self.sidecarManager.tracePresentation(event: "tts.completed", traceId: traceId, turnId: turnId)
         }
     }
 

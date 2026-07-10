@@ -601,8 +601,10 @@ struct BlueCursorView: View {
         let arcHeight = min(distance * 0.2, 80.0)
         let controlPoint = CGPoint(x: midPoint.x, y: midPoint.y - arcHeight)
 
-        navigationAnimationTimer = Timer.scheduledTimer(withTimeInterval: frameInterval, repeats: true) { _ in
+        navigationAnimationTimer = Timer.scheduledTimer(withTimeInterval: frameInterval, repeats: true) { animationTimer in
             Task { @MainActor in
+                // Invalidation cannot recall a tick already enqueued on the main actor.
+                guard animationTimer.isValid, self.navigationAnimationTimer === animationTimer else { return }
                 currentFrame += 1
 
                 if currentFrame > totalFrames {
