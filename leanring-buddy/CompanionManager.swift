@@ -48,6 +48,14 @@ struct LessonBuildInProgress {
     let startedAt: Date
 }
 
+/// A spoken line mirrored as a typed-out bubble beside the blue Clicky cursor
+/// (rendered by BlueCursorView). The id makes two identical consecutive lines
+/// compare as different, so onChange re-fires and the bubble re-types.
+struct SpokenResponseBubble: Equatable {
+    let id: UUID
+    let text: String
+}
+
 @MainActor
 final class CompanionManager: ObservableObject {
     @Published private(set) var voiceState: CompanionVoiceState = .idle
@@ -65,6 +73,11 @@ final class CompanionManager: ObservableObject {
     /// the sidecar dies mid-build and neither event ever arrives.
     @Published private(set) var lessonBuildsInProgress: [String: LessonBuildInProgress] = [:]
 
+    /// The line the TTS is currently reading, mirrored as a typewriter bubble
+    /// beside the blue cursor so the user can read along. Nil hides the bubble.
+    @Published private(set) var spokenResponseBubble: SpokenResponseBubble?
+    private var spokenResponseBubbleClearTask: Task<Void, Never>?
+
     /// Screen location (global AppKit coords) of a detected UI element the
     /// buddy should fly to and point at. Parsed from the brain response;
     /// observed by BlueCursorView to trigger the flight animation.
@@ -79,10 +92,6 @@ final class CompanionManager: ObservableObject {
     let buddyDictationManager = BuddyDictationManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
-
-    /// Cursor-following text bubble that mirrors whatever Clicky is speaking,
-    /// so the user can read along with the TTS.
-    private let responseTextOverlayManager = CompanionResponseOverlayManager()
     let sidecarManager = SidecarProcessManager()
     // Response text is now displayed inline on the cursor overlay via
     // streamingResponseText, so no separate response overlay manager is needed.
@@ -735,7 +744,8 @@ final class CompanionManager: ObservableObject {
             // Cancel any in-progress response and TTS from a previous utterance
             currentResponseTask?.cancel()
             textToSpeechClient.stopPlayback()
-            responseTextOverlayManager.hideOverlay()
+            spokenResponseBubbleClearTask?.cancel()
+            spokenResponseBubble = nil
             clearDetectedElementLocation()
 
             ClickyAnalytics.trackPushToTalkStarted()
@@ -930,17 +940,27 @@ final class CompanionManager: ObservableObject {
     /// schedule it more than once. Waits 8 seconds and, only if the turn is
     /// still running (task not cancelled), speaks a single reassuring line. This
     /// deliberately does NOT change voiceState — the processing spinner stays.
-    /// Shows a spoken line as a cursor-following text bubble so the user can
-    /// read along with the TTS. There is no token streaming — replies arrive
-    /// whole — so the bubble shows the full text at once and stays up roughly
-    /// as long as the speech takes (reading pace ≈ speaking pace, ~13
-    /// characters per second), with a floor so short lines linger long enough
-    /// to read.
+    /// Mirrors a spoken line as a typed-out bubble beside the blue cursor so
+    /// the user can read along with the TTS (BlueCursorView renders it with
+    /// the same typewriter rhythm as the pointing bubble). Cleared after
+    /// roughly the duration of the speech — reading pace ≈ speaking pace,
+    /// ~13 characters per second, plus a short linger — or immediately when
+    /// the user starts a new utterance.
     private func displaySpokenTextBubble(_ spokenText: String) {
-        responseTextOverlayManager.showOverlayAndBeginStreaming()
-        responseTextOverlayManager.updateStreamingText(spokenText)
-        let estimatedSpeechSeconds = max(6, min(60, Double(spokenText.count) / 13.0))
-        responseTextOverlayManager.finishStreaming(hideAfterSeconds: estimatedSpeechSeconds)
+        let responseBubble = SpokenResponseBubble(id: UUID(), text: spokenText)
+        spokenResponseBubble = responseBubble
+
+        spokenResponseBubbleClearTask?.cancel()
+        let bubbleVisibleSeconds = max(8.0, min(75.0, Double(spokenText.count) / 13.0 + 4.0))
+        spokenResponseBubbleClearTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(bubbleVisibleSeconds * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            // Only clear the bubble this task was armed for — a newer line
+            // owns its own clear task.
+            if self.spokenResponseBubble?.id == responseBubble.id {
+                self.spokenResponseBubble = nil
+            }
+        }
     }
 
     private func scheduleLongTurnAcknowledgementIfNeeded() {

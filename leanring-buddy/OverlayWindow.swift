@@ -84,6 +84,13 @@ struct NavigationBubbleSizePreferenceKey: PreferenceKey {
     }
 }
 
+struct ResponseBubbleSizePreferenceKey: PreferenceKey {
+    static var defaultValue: CGSize = .zero
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        value = nextValue()
+    }
+}
+
 /// The buddy's behavioral mode. Controls whether it follows the cursor,
 /// is flying toward a detected UI element, or is pointing at an element.
 enum BuddyNavigationMode {
@@ -163,6 +170,19 @@ struct BlueCursorView: View {
     /// True when the buddy is flying BACK to the cursor after pointing.
     /// Only during the return flight can cursor movement cancel the animation.
     @State private var isReturningToCursor: Bool = false
+
+    // MARK: - Spoken-Response Bubble State
+
+    /// Typed-out mirror of the line the TTS is currently reading, shown as a
+    /// bubble beside the buddy with the same typewriter rhythm as the pointing
+    /// bubble. Driven by companionManager.spokenResponseBubble.
+    @State private var responseBubbleTypedText: String = ""
+    @State private var responseBubbleOpacity: Double = 0.0
+    @State private var responseBubbleSize: CGSize = .zero
+    /// Identifies which SpokenResponseBubble the typing timer is animating,
+    /// so a replaced or cleared bubble stops its stale timer.
+    @State private var responseBubbleGenerationID: UUID?
+    @State private var responseTypingTimer: Timer?
 
     private let fullWelcomeMessage = "hey! i'm clicky"
 
@@ -244,6 +264,39 @@ struct BlueCursorView: View {
                     }
             }
 
+            // Spoken-response bubble — mirrors the line the TTS is reading so
+            // the user can read along. Same visual language and typing rhythm
+            // as the pointing bubble, but wraps to a readable width and
+            // follows the buddy wherever it is (during a pointing flight it
+            // stacks below the pointer phrase so the two never overlap).
+            if buddyIsVisibleOnThisScreen && !responseBubbleTypedText.isEmpty {
+                Text(responseBubbleTypedText)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.white)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: 304, alignment: .leading)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(DS.Colors.overlayCursorBlue)
+                            .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.5), radius: 6, x: 0, y: 0)
+                    )
+                    .overlay(
+                        GeometryReader { geo in
+                            Color.clear
+                                .preference(key: ResponseBubbleSizePreferenceKey.self, value: geo.size)
+                        }
+                    )
+                    .opacity(responseBubbleOpacity)
+                    .position(responseBubblePosition)
+                    .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
+                    .animation(.easeOut(duration: 0.4), value: responseBubbleOpacity)
+                    .onPreferenceChange(ResponseBubbleSizePreferenceKey.self) { newSize in
+                        responseBubbleSize = newSize
+                    }
+            }
+
             // Blue triangle cursor — shown when idle or while TTS is playing (responding).
             // All three states (triangle, waveform, spinner) stay in the view tree
             // permanently and cross-fade via opacity so SwiftUI doesn't remove/re-insert
@@ -316,6 +369,10 @@ struct BlueCursorView: View {
         .onDisappear {
             timer?.invalidate()
             navigationAnimationTimer?.invalidate()
+            responseTypingTimer?.invalidate()
+        }
+        .onChange(of: companionManager.spokenResponseBubble) { newSpokenBubble in
+            startResponseBubbleTyping(newSpokenBubble)
         }
         .onChange(of: companionManager.detectedElementScreenLocation) { newLocation in
             // When a UI element location is detected, navigate the buddy to
@@ -352,6 +409,75 @@ struct BlueCursorView: View {
             return isCursorOnThisScreen
         case .navigatingToTarget, .pointingAtTarget:
             return true
+        }
+    }
+
+    // MARK: - Spoken-Response Bubble
+
+    /// Where the response bubble sits: beside the buddy like the other
+    /// bubbles, stacked below the pointer phrase when both are visible, and
+    /// clamped so a long multi-line reply never renders off-screen.
+    private var responseBubblePosition: CGPoint {
+        let pointerBubbleStackOffset: CGFloat =
+            buddyNavigationMode == .pointingAtTarget && !navigationBubbleText.isEmpty
+                ? navigationBubbleSize.height + 8
+                : 0
+
+        let unclampedCenterX = cursorPosition.x + 10 + (responseBubbleSize.width / 2)
+        let unclampedCenterY = cursorPosition.y + 6 + pointerBubbleStackOffset + (responseBubbleSize.height / 2)
+
+        let clampedCenterX = max(
+            responseBubbleSize.width / 2 + 12,
+            min(unclampedCenterX, screenFrame.width - responseBubbleSize.width / 2 - 12)
+        )
+        let clampedCenterY = max(
+            responseBubbleSize.height / 2 + 12,
+            min(unclampedCenterY, screenFrame.height - responseBubbleSize.height / 2 - 12)
+        )
+        return CGPoint(x: clampedCenterX, y: clampedCenterY)
+    }
+
+    /// Types the spoken line into the response bubble one character at a time,
+    /// mirroring the pointing bubble's rhythm. A repeating timer (instead of
+    /// the pointing bubble's recursive asyncAfter) makes replacement safe: a
+    /// newer line invalidates the old timer via the generation id.
+    private func startResponseBubbleTyping(_ spokenBubble: SpokenResponseBubble?) {
+        responseTypingTimer?.invalidate()
+        responseTypingTimer = nil
+
+        guard let spokenBubble else {
+            responseBubbleGenerationID = nil
+            responseBubbleOpacity = 0.0
+            // Let the fade-out play before removing the view; skip the wipe if
+            // a newer bubble started typing in the meantime.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                if self.responseBubbleGenerationID == nil {
+                    self.responseBubbleTypedText = ""
+                }
+            }
+            return
+        }
+
+        responseBubbleGenerationID = spokenBubble.id
+        responseBubbleTypedText = ""
+        responseBubbleOpacity = 1.0
+
+        var typedCharacterCount = 0
+        responseTypingTimer = Timer.scheduledTimer(withTimeInterval: 0.045, repeats: true) { typingTimer in
+            guard self.responseBubbleGenerationID == spokenBubble.id else {
+                typingTimer.invalidate()
+                return
+            }
+            guard typedCharacterCount < spokenBubble.text.count else {
+                typingTimer.invalidate()
+                return
+            }
+            let nextCharacterIndex = spokenBubble.text.index(
+                spokenBubble.text.startIndex,
+                offsetBy: typedCharacterCount
+            )
+            self.responseBubbleTypedText.append(spokenBubble.text[nextCharacterIndex])
+            typedCharacterCount += 1
         }
     }
 
