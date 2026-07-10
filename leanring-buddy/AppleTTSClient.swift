@@ -61,6 +61,22 @@ final class AppleTTSClient: NSObject, CompanionTTSClient {
         let englishVoices = AVSpeechSynthesisVoice.speechVoices()
             .filter { $0.language == "en-US" }
 
+        // Optional override: `defaults write com.openclicky.app clickyPreferredVoiceName Zoe`.
+        // Multiple premium voices tie under the quality sort below, so without this
+        // the winner is just whichever voice the OS happens to list first.
+        if let preferredVoiceName = UserDefaults.standard.string(forKey: "clickyPreferredVoiceName") {
+            let voicesMatchingPreferredName = englishVoices.filter {
+                $0.name.localizedCaseInsensitiveContains(preferredVoiceName)
+            }
+            // The same voice name can exist at several quality tiers
+            // (e.g. "Zoe (Enhanced)" and "Zoe (Premium)") — pick the best one.
+            if let bestMatchingVoice = voicesMatchingPreferredName.max(by: {
+                qualityRank(for: $0.quality) < qualityRank(for: $1.quality)
+            }) {
+                return bestMatchingVoice
+            }
+        }
+
         return englishVoices.sorted { firstVoice, secondVoice in
             qualityRank(for: firstVoice.quality) > qualityRank(for: secondVoice.quality)
         }.first ?? AVSpeechSynthesisVoice(language: "en-US")

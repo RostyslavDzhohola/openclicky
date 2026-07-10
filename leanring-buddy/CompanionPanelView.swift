@@ -7,6 +7,7 @@
 //  like Loom's recording panel — dark, rounded, minimal, and special.
 //
 
+import AVFoundation
 import SwiftUI
 
 struct CompanionPanelView: View {
@@ -75,10 +76,15 @@ struct CompanionPanelView: View {
         .frame(width: 320)
         .background(panelBackground)
         .onAppear {
-            // Pull the latest topic list and brain sign-in state each time the
-            // panel opens so its rows reflect reality without a manual refresh.
-            companionManager.refreshWorkspaces()
+            // Pull the latest brain sign-in state each time the panel opens so its
+            // rows reflect reality without a manual refresh.
             companionManager.refreshBrainAuthStatus()
+            // Re-read topics and lessons from disk so the lessons picker reflects
+            // any lessons created while the panel was closed.
+            companionManager.refreshLessonTopicListings()
+            // Re-read connected microphones so the mic picker reflects devices
+            // plugged in or removed while the panel was closed.
+            companionManager.refreshAvailableMicrophones()
         }
     }
 
@@ -86,7 +92,8 @@ struct CompanionPanelView: View {
 
     /// Groups the brain status and picker rows shown once the user is onboarded
     /// and fully permissioned. Order: status concerns first (sidecar health,
-    /// account sign-in), then the pickers (backend, model, topic).
+    /// account sign-in), then the pickers (backend, model, thinking), then the
+    /// lessons section.
     private var brainSection: some View {
         VStack(spacing: 4) {
             sidecarStatusRow
@@ -95,7 +102,8 @@ struct CompanionPanelView: View {
             backendPickerRow
             modelPickerRow
             thinkingPickerRow
-            topicPickerSection
+            microphonePickerRow
+            lessonsSection
         }
     }
 
@@ -548,9 +556,7 @@ struct CompanionPanelView: View {
             segmentedPickerRow(
                 label: "Model",
                 options: [
-                    (displayName: "Default", value: "default"),
-                    (displayName: "GPT-5.5", value: "gpt-5.5"),
-                    (displayName: "Codex", value: "gpt-5.5-codex")
+                    (displayName: "GPT-5.5", value: "gpt-5.5")
                 ],
                 selectedValue: companionManager.selectedCodexModel,
                 onSelect: { companionManager.setSelectedCodexModel($0) }
@@ -664,6 +670,96 @@ struct CompanionPanelView: View {
                 )
         }
         .buttonStyle(.plain)
+        .pointerCursor()
+    }
+
+    // MARK: - Microphone Picker
+
+    /// The "Microphone" row. Lets the user pin a specific input device so macOS
+    /// can't silently route push-to-talk capture through AirPods (which forces
+    /// the awful-sounding Bluetooth HFP codec). "System default" keeps the OS
+    /// behaviour. Styled to match the Model / Thinking rows: a 13pt label on the
+    /// left and a borderless menu control on the right.
+    private var microphonePickerRow: some View {
+        HStack {
+            Text("Microphone")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(DS.Colors.textSecondary)
+
+            Spacer()
+
+            microphoneMenu
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// The display name shown on the menu's label: the pinned microphone's name
+    /// when one is selected and still connected, "System default" when nothing is
+    /// pinned, and an explicit unavailable notice when the pinned microphone is
+    /// currently disconnected (the pin stays persisted).
+    private var selectedMicrophoneDisplayName: String {
+        guard let selectedMicrophoneUID = companionManager.selectedMicrophoneUID else {
+            return "System default"
+        }
+        let matchingMicrophone = companionManager.availableMicrophones
+            .first { $0.id == selectedMicrophoneUID }
+        // A pin exists but its device is not connected right now: be honest that
+        // capture is falling back while the pin itself is still persisted — a
+        // plain "System default" would misrepresent the pin as cleared.
+        return matchingMicrophone?.displayName ?? "Unavailable — using system default"
+    }
+
+    /// Borderless menu mirroring the lessons menu's styling. Lists "System
+    /// default" first (checkmark when nothing is pinned) then every connected
+    /// microphone (checkmark on the pinned one).
+    private var microphoneMenu: some View {
+        Menu {
+            Button {
+                companionManager.setSelectedMicrophoneUID(nil)
+            } label: {
+                if companionManager.selectedMicrophoneUID == nil {
+                    Label("System default", systemImage: "checkmark")
+                } else {
+                    Text("System default")
+                }
+            }
+
+            ForEach(companionManager.availableMicrophones) { microphone in
+                Button {
+                    companionManager.setSelectedMicrophoneUID(microphone.id)
+                } label: {
+                    if companionManager.selectedMicrophoneUID == microphone.id {
+                        Label(microphone.displayName, systemImage: "checkmark")
+                    } else {
+                        Text(microphone.displayName)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text(selectedMicrophoneDisplayName)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(DS.Colors.textPrimary)
+                    .lineLimit(1)
+
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(DS.Colors.textTertiary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.white.opacity(0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+            )
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
         .pointerCursor()
     }
 
@@ -882,89 +978,58 @@ struct CompanionPanelView: View {
         SidecarStatusRow(sidecarManager: companionManager.sidecarManager)
     }
 
-    // MARK: - Topic Picker
+    // MARK: - Lessons
 
-    /// The learning-topic block: a labeled topic menu, the "Next lesson" /
-    /// "New chat" action buttons beneath it, and a first-run hint that nudges the
-    /// user toward starting their first topic by voice.
-    private var topicPickerSection: some View {
+    /// A picker that lists every learning topic and its lessons; picking a lesson
+    /// opens that lesson's HTML directly, and a final item still opens the full
+    /// static dashboard. Topics are managed entirely by voice ("teach me …");
+    /// lessons are found by navigation, not conversation.
+    private var lessonsSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("Learning topic")
+                Text("Lessons")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(DS.Colors.textSecondary)
 
                 Spacer()
 
-                topicMenu
+                lessonsMenu
             }
 
-            topicActionButtons
-
-            if !hasNonGeneralTopics {
-                Text("say \"teach me …\" to start a topic")
-                    .font(.system(size: 10))
-                    .foregroundColor(DS.Colors.textTertiary)
-            }
+            Text("say \"teach me …\" to start a topic")
+                .font(.system(size: 10))
+                .foregroundColor(DS.Colors.textTertiary)
         }
         .padding(.vertical, 4)
     }
 
-    /// "New chat" starts a fresh conversation for the current backend + topic; it
-    /// is always available. "Next lesson" only makes sense inside a real topic, so
-    /// it sits beside "New chat" whenever a non-general topic is selected.
-    private var topicActionButtons: some View {
-        HStack(spacing: 8) {
-            if companionManager.selectedWorkspaceId != "general" {
-                topicActionButton(title: "Next lesson") {
-                    companionManager.requestNextLesson()
-                }
-            }
-
-            topicActionButton(title: "New chat") {
-                companionManager.resetCurrentConversation()
-            }
-        }
-    }
-
-    private func topicActionButton(title: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(DS.Colors.textTertiary)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(
-                    RoundedRectangle(cornerRadius: 5, style: .continuous)
-                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
-                )
-        }
-        .buttonStyle(.plain)
-        .pointerCursor()
-    }
-
-    /// Whether the learner has started at least one real topic beyond the default
-    /// general workspace. Drives the first-run "say teach me …" hint.
-    private var hasNonGeneralTopics: Bool {
-        companionManager.workspaces.contains { $0.id != "general" }
-    }
-
-    private var topicMenu: some View {
+    /// Borderless menu that mirrors the old topic picker's styling. Each topic is
+    /// a nested submenu of its lessons; a divider then an "All lessons" item keeps
+    /// the full dashboard reachable.
+    private var lessonsMenu: some View {
         Menu {
-            ForEach(companionManager.workspaces) { workspace in
-                Button(action: {
-                    companionManager.setSelectedWorkspaceId(workspace.id)
-                }) {
-                    if companionManager.selectedWorkspaceId == workspace.id {
-                        Label(topicMenuLabel(for: workspace), systemImage: "checkmark")
-                    } else {
-                        Text(topicMenuLabel(for: workspace))
+            if companionManager.lessonTopicListings.isEmpty {
+                Text("no lessons yet")
+            } else {
+                ForEach(companionManager.lessonTopicListings) { topic in
+                    Menu(topic.displayName) {
+                        ForEach(topic.lessons) { lesson in
+                            Button(lesson.displayTitle) {
+                                companionManager.openLesson(lesson)
+                            }
+                        }
                     }
                 }
             }
+
+            Divider()
+
+            Button("All lessons (dashboard)") {
+                companionManager.openLessonsDashboard()
+            }
         } label: {
             HStack(spacing: 4) {
-                Text(selectedWorkspaceName)
+                Text("Open lessons")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(DS.Colors.textPrimary)
                     .lineLimit(1)
@@ -988,22 +1053,6 @@ struct CompanionPanelView: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .pointerCursor()
-    }
-
-    /// Display name for the currently selected topic, falling back to "General"
-    /// when no matching workspace is loaded (the default general workspace).
-    private var selectedWorkspaceName: String {
-        companionManager.workspaces
-            .first(where: { $0.id == companionManager.selectedWorkspaceId })?
-            .name ?? "General"
-    }
-
-    private func topicMenuLabel(for workspace: SidecarWorkspace) -> String {
-        // The default general workspace isn't a lesson-bearing topic, so it shows
-        // just its name; real topics carry an "— N lessons" subtitle.
-        guard workspace.id != "general" else { return workspace.name }
-        let lessonNoun = workspace.lessonCount == 1 ? "lesson" : "lessons"
-        return "\(workspace.name) — \(workspace.lessonCount) \(lessonNoun)"
     }
 
     // MARK: - DM Farza Button

@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { chatModelForBackend } from "./chatModelForBackend.mjs";
 
 const sidecarDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const commandLineArguments = process.argv.slice(2);
@@ -192,7 +193,7 @@ async function runSidecarTeachComparison(runName, backend) {
       type: "chat",
       backend,
       workspaceId: "spanish-for-travel",
-      model: "claude-sonnet-4-6",
+      model: chatModelForBackend(backend),
       text: missionText,
       images: [],
       teachIntent: true,
@@ -366,6 +367,25 @@ function printWorkspaceReport(analysis) {
   console.log(`[report] assets/: ${analysis.assetsPresent ? "present" : "missing"}`);
   console.log(`[report] NOTES.md: ${analysis.notesPresent ? "present" : "missing"}`);
   console.log(`[report] teach SKILL.md sha256: ${analysis.skillSha || "(missing)"}`);
+
+  // Explicit enclosing-folder completeness check against the full set of
+  // artifacts a finished teach run is expected to leave behind.
+  const expectedArtifacts = [
+    ["MISSION.md", analysis.missionPresent],
+    ["RESOURCES.md", analysis.resourcesPresent],
+    ["lessons/0001-*.html", analysis.hasCorrect0001Lesson],
+    ["reference/", analysis.referencePresent],
+    ["learning-records/", analysis.learningRecordsPresent],
+    ["assets/", analysis.assetsPresent],
+    ["NOTES.md", analysis.notesPresent],
+    ["teach SKILL.md", Boolean(analysis.skillSha)],
+  ];
+  const missingArtifacts = expectedArtifacts.filter(([, present]) => !present).map(([name]) => name);
+  if (missingArtifacts.length === 0) {
+    console.log(`[report] artifacts: COMPLETE — all ${expectedArtifacts.length} expected artifacts present`);
+  } else {
+    console.log(`[report] artifacts: INCOMPLETE — missing: ${missingArtifacts.join(", ")}`);
+  }
 }
 
 function formatTableCell(value, width) {
@@ -431,24 +451,54 @@ async function main() {
   console.log(`[compare] root: ${comparisonRoot}`);
   console.log("[compare] starting four teach runs concurrently");
 
-  const runPromises = [
-    runSidecarTeachComparison("sidecar-claude", "claude"),
-    runSidecarTeachComparison("sidecar-codex", "codex"),
-    runPlainTeachComparison("plain-claude", "claude-code", "claude", [
-      "--dangerously-skip-permissions",
-      "-p",
-      `/teach ${missionText}`,
-    ]),
-    runPlainTeachComparison("plain-codex", "codex", "codex", [
-      "exec",
-      "--skip-git-repo-check",
-      "--sandbox",
-      "danger-full-access",
-      `$teach ${missionText}`,
-    ]),
-  ];
+  // The two claude runs go fully in parallel. The two codex runs must NOT
+  // overlap: both authenticate against the single ~/.codex/auth.json login,
+  // and a concurrent OAuth token refresh makes one run's in-flight token 401.
+  // So we serialize the codex runs relative to each other (still concurrent
+  // with the claude runs) to keep the comparison fair.
+  const startedSidecarClaude = runSidecarTeachComparison("sidecar-claude", "claude");
+  const startedPlainClaude = runPlainTeachComparison("plain-claude", "claude-code", "claude", [
+    "--dangerously-skip-permissions",
+    "-p",
+    `/teach ${missionText}`,
+  ]);
 
-  const settledResults = await Promise.allSettled(runPromises);
+  const settleRun = (runPromise) =>
+    runPromise.then(
+      (value) => ({ status: "fulfilled", value }),
+      (reason) => ({ status: "rejected", reason })
+    );
+
+  const startedCodexChain = (async () => {
+    const sidecarCodexOutcome = await settleRun(
+      runSidecarTeachComparison("sidecar-codex", "codex")
+    );
+    const plainCodexOutcome = await settleRun(
+      runPlainTeachComparison("plain-codex", "codex", "codex", [
+        "exec",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "danger-full-access",
+        `$teach ${missionText}`,
+      ])
+    );
+    return { sidecarCodexOutcome, plainCodexOutcome };
+  })();
+
+  const [sidecarClaudeOutcome, plainClaudeOutcome, codexChainOutcomes] = await Promise.all([
+    settleRun(startedSidecarClaude),
+    settleRun(startedPlainClaude),
+    startedCodexChain,
+  ]);
+
+  // Rebuild the settled array in the same order as runDefinitions:
+  // [sidecar-claude, sidecar-codex, plain-claude, plain-codex].
+  const settledResults = [
+    sidecarClaudeOutcome,
+    codexChainOutcomes.sidecarCodexOutcome,
+    plainClaudeOutcome,
+    codexChainOutcomes.plainCodexOutcome,
+  ];
   const analyses = runDefinitions.map((runDefinition, index) =>
     analyzeWorkspace(runDefinition, settledResults[index])
   );
@@ -459,6 +509,20 @@ async function main() {
   console.log(
     "\n[compare] note: lesson CONTENT is expected to differ run-to-run because of LLM nondeterminism; this harness asserts only structure and behavior."
   );
+
+  // When artifacts are kept, print an easy-to-open index of every run's
+  // workspace + first lesson so the operator can review each side by side.
+  if (keepArtifacts) {
+    console.log("\n[review] artifacts kept — open these to compare:");
+    for (const analysis of analyses) {
+      console.log(`[review] ${analysis.runName} — folder: ${analysis.workspaceDirectory}`);
+      const firstLesson = analysis.lessonDetails.find((lesson) => lesson.fileName.startsWith("0001-"));
+      if (firstLesson) {
+        console.log(`[review]   open lesson: ${join(analysis.workspaceDirectory, "lessons", firstLesson.fileName)}`);
+      }
+    }
+  }
+
   return analyses.every((analysis) => analysis.missionPresent && analysis.hasCorrect0001Lesson);
 }
 

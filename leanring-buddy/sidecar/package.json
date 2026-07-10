@@ -10,12 +10,14 @@
   },
   "scripts": {
     "start": "node index.mjs",
+    "test": "node --test test/unit/*.test.mjs",
     "drive": "node test/drive.mjs chat",
     "drive:oneshot": "node test/drive.mjs oneshot",
     "drive:teach": "node test/drive.mjs teach",
     "drive:compare": "node test/compare.mjs",
     "drive:auth": "node test/drive.mjs auth",
     "drive:resume": "node test/drive.mjs resume",
+    "drive:split": "node test/drive.mjs split",
     "drive:workspaces": "node test/drive.mjs workspaces",
     "clean": "rm -rf node_modules"
   },

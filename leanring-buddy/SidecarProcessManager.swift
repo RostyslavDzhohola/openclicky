@@ -53,6 +53,9 @@ struct SidecarEvent {
     var version: String? { rawPayload["version"] as? String }
     var node: String? { rawPayload["node"] as? String }
     var sidecarPath: String? { rawPayload["sidecarPath"] as? String }
+    var lessonsRoot: String? { rawPayload["lessonsRoot"] as? String }
+    var dashboardPath: String? { rawPayload["dashboardPath"] as? String }
+    var topicName: String? { rawPayload["topicName"] as? String }
     var phase: String? { rawPayload["phase"] as? String }
     var tool: String? { rawPayload["tool"] as? String }
     var detail: String? { rawPayload["detail"] as? String }
@@ -131,6 +134,14 @@ final class SidecarProcessManager: ObservableObject {
     var onLog: ((SidecarEvent) -> Void)?
     var onLessonCreated: (((workspaceId: String, path: String, openedByAgent: Bool)) -> Void)?
 
+    /// Absolute path of the static lessons dashboard, reported by the sidecar's
+    /// ready event. Nil until the sidecar has started at least once.
+    @Published private(set) var lessonsDashboardPath: String?
+
+    /// Fired when a background lesson dispatch fails after the chat turn already
+    /// completed — the app speaks this, since no request is pending to throw to.
+    var onTeachError: (((topicName: String, message: String)) -> Void)?
+
     private let userDefaults = UserDefaults.standard
     private let fileManager = FileManager.default
     private let nodePathDefaultsKey = "clickyNodePath"
@@ -208,12 +219,10 @@ final class SidecarProcessManager: ObservableObject {
     func sendChat(
         requestId: String = UUID().uuidString,
         backend: String,
-        workspaceId: String,
         model: String,
         effort: String,
         text: String,
         images: [(path: String, label: String)],
-        teachIntent: Bool,
         onStatus: (@MainActor @Sendable (SidecarEvent) -> Void)?
     ) async throws -> String {
         let event = try await sendRequest(
@@ -222,12 +231,10 @@ final class SidecarProcessManager: ObservableObject {
                 "id": requestId,
                 "type": "chat",
                 "backend": backend,
-                "workspaceId": workspaceId,
                 "model": model,
                 "effort": effort,
                 "text": text,
-                "images": images.map { ["path": $0.path, "label": $0.label] },
-                "teachIntent": teachIntent
+                "images": images.map { ["path": $0.path, "label": $0.label] }
             ],
             onStatus: onStatus
         )
@@ -661,6 +668,7 @@ final class SidecarProcessManager: ObservableObject {
             readyTimeoutWorkItem?.cancel()
             readyTimeoutWorkItem = nil
             status = .ready
+            lessonsDashboardPath = event.dashboardPath
             onReady?(event)
             if let readyContinuation {
                 self.readyContinuation = nil
@@ -693,6 +701,12 @@ final class SidecarProcessManager: ObservableObject {
                     openedByAgent: event.openedByAgent ?? false
                 ))
             }
+
+        case "teachError":
+            onTeachError?((
+                topicName: event.topicName ?? "your topic",
+                message: event.message ?? "lesson generation failed"
+            ))
 
         case "log":
             onLog?(event)

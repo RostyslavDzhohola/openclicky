@@ -23,10 +23,11 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { COMPANION_RULES } from "./companionRules.mjs";
+import { COMPANION_CHAT_NOTES, COMPANION_WORKSPACE_NOTES } from "./companionRules.mjs";
 import { emitLog } from "./protocol.mjs";
 
 export const GENERAL_WORKSPACE_ID = "general";
+export const CHAT_WORKSPACE_ID = ".chat";
 
 /** Root folder for all workspaces. Overridable for terminal test runs. */
 export function lessonsRootDirectory() {
@@ -41,6 +42,18 @@ export function workspacePath(workspaceId) {
 
 function clickyMetadataPath(workspaceId) {
   return join(workspacePath(workspaceId), ".clicky.json");
+}
+
+function syncAgentsFileWithExpectedContent(directoryPath, expectedAgentsFileContent) {
+  const agentsFilePath = join(directoryPath, "AGENTS.md");
+  const currentAgentsFileContent = existsSync(agentsFilePath)
+    ? readFileSync(agentsFilePath, "utf8")
+    : null;
+  // Heal older workspaces with the fatter persona automatically, and keep
+  // Codex workspace notes in lockstep with the code.
+  if (currentAgentsFileContent !== expectedAgentsFileContent) {
+    writeFileSync(agentsFilePath, expectedAgentsFileContent);
+  }
 }
 
 export function readWorkspaceMetadata(workspaceId) {
@@ -86,8 +99,8 @@ export function slugifyTopicName(topicName) {
 
 /**
  * Creates (or returns, if it already exists) a workspace folder for a topic.
- * Writes AGENTS.md so the Codex CLI natively picks up the companion voice
- * rules (Claude gets the same rules via the system-prompt append instead).
+ * Writes AGENTS.md so the Codex CLI natively picks up slim companion voice
+ * notes (Claude gets the full rules via the system-prompt append instead).
  * The teach skill itself is installed by ensureTeachSkillInstalled().
  */
 export function createWorkspace(topicName) {
@@ -100,10 +113,8 @@ export function createWorkspace(topicName) {
 
   mkdirSync(directoryPath, { recursive: true });
 
-  const agentsFilePath = join(directoryPath, "AGENTS.md");
-  if (!existsSync(agentsFilePath)) {
-    writeFileSync(agentsFilePath, COMPANION_RULES + "\n");
-  }
+  const expectedAgentsFileContent = COMPANION_WORKSPACE_NOTES + "\n";
+  syncAgentsFileWithExpectedContent(directoryPath, expectedAgentsFileContent);
 
   if (!alreadyExisted) {
     updateWorkspaceMetadata(workspaceId, {
@@ -115,10 +126,6 @@ export function createWorkspace(topicName) {
   }
 
   return describeWorkspace(workspaceId);
-}
-
-export function ensureGeneralWorkspaceExists() {
-  createWorkspace(GENERAL_WORKSPACE_ID);
 }
 
 export function describeWorkspace(workspaceId) {
@@ -160,4 +167,37 @@ export function listWorkspaces() {
 
 export function workspaceExists(workspaceId) {
   return existsSync(workspacePath(workspaceId));
+}
+
+/**
+ * The ephemeral chat plane lives in a hidden dot-folder under the lessons
+ * root: existing session/metadata machinery works on it unchanged, while the
+ * dot prefix keeps it out of listWorkspaces(), the roster, and the dashboard.
+ * Created directly (not via createWorkspace) because slugifyTopicName would
+ * strip the dot.
+ */
+export function ensureChatWorkspaceExists() {
+  const chatDirectoryPath = workspacePath(CHAT_WORKSPACE_ID);
+  const chatWorkspaceAlreadyExisted = existsSync(chatDirectoryPath);
+  mkdirSync(chatDirectoryPath, { recursive: true });
+
+  const expectedAgentsFileContent = COMPANION_CHAT_NOTES + "\n";
+  syncAgentsFileWithExpectedContent(chatDirectoryPath, expectedAgentsFileContent);
+
+  if (!chatWorkspaceAlreadyExisted) {
+    updateWorkspaceMetadata(CHAT_WORKSPACE_ID, {
+      name: "ephemeral chat",
+      slug: CHAT_WORKSPACE_ID,
+      createdAt: new Date().toISOString(),
+    });
+  }
+}
+
+/** Chat context never survives an app restart (design decision). */
+export function clearChatSessionIds() {
+  if (!workspaceExists(CHAT_WORKSPACE_ID)) return;
+  updateWorkspaceMetadata(CHAT_WORKSPACE_ID, {
+    claudeSessionId: null,
+    codexThreadId: null,
+  });
 }

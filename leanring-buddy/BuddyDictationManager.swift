@@ -10,6 +10,7 @@
 import AppKit
 import AVFoundation
 import Combine
+import CoreAudio
 import Foundation
 import Speech
 
@@ -204,6 +205,15 @@ enum BuddyDictationPermissionProblem {
     case speechRecognitionDenied
 }
 
+/// A microphone the user can pin for push-to-talk capture. The `id` is the
+/// CoreAudio device UID (identical to `AVCaptureDevice.uniqueID`), which is what
+/// we persist and later translate back into a live `AudioDeviceID` when a
+/// recording session starts.
+struct CaptureMicrophone: Identifiable, Equatable {
+    let id: String       // AVCaptureDevice.uniqueID == CoreAudio device UID
+    let displayName: String
+}
+
 private enum BuddyDictationStartSource {
     case microphoneButton
     case keyboardShortcut
@@ -217,6 +227,21 @@ private struct BuddyDictationDraftCallbacks {
 @MainActor
 final class BuddyDictationManager: NSObject, ObservableObject {
     private static let defaultFinalTranscriptFallbackDelaySeconds: TimeInterval = 2.4
+    /// UserDefaults key holding the CoreAudio UID of the microphone the user has
+    /// pinned for push-to-talk. Absent / `nil` means "use the system default
+    /// input" (which is what macOS auto-routes to AirPods, the case this picker
+    /// exists to override).
+    private static let preferredMicrophoneUIDDefaultsKey = "clickyPreferredMicrophoneUID"
+    /// UserDefaults key holding the pre-session default input device UID while
+    /// a pinned microphone is active, so a crash or force-quit can restore the
+    /// user's system-wide default on the next launch.
+    private static let defaultInputDeviceUIDToRestoreAfterCrashDefaultsKey = "clickyDefaultInputDeviceUIDToRestoreAfterCrash"
+    /// Peak session power (on the same 0–1 scale as `currentAudioPowerLevel`,
+    /// i.e. RMS boosted by 10.2 and clamped) below which a session is considered
+    /// to have captured no audible speech. Normal speech peaks well above 0.1;
+    /// a dead or non-engaging capture device (e.g. a Bluetooth HFP mic that
+    /// never switched on) hovers near 0.
+    private static let noAudibleSpeechPeakAudioPowerThreshold: CGFloat = 0.05
     private static let recordedAudioPowerHistoryLength = 44
     private static let recordedAudioPowerHistoryBaselineLevel: CGFloat = 0.02
     private static let recordedAudioPowerHistorySampleIntervalSeconds: TimeInterval = 0.07
@@ -235,6 +260,14 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     @Published private(set) var transcriptionProviderDisplayName = ""
     @Published var lastErrorMessage: String?
     @Published private(set) var currentPermissionProblem: BuddyDictationPermissionProblem?
+
+    /// Invoked when a dictation session ends having captured essentially no
+    /// audio (empty transcript AND peak power below
+    /// `noAudibleSpeechPeakAudioPowerThreshold`), or when the capture pipeline
+    /// fails to start at all. The owner speaks a hint so silent-capture
+    /// failures (e.g. a Bluetooth HFP mic that never engaged) are never
+    /// swallowed without user-visible feedback.
+    var onDictationProducedNoAudibleSpeech: (() -> Void)?
 
     var isDictationInProgress: Bool {
         isPreparingToRecord || isRecordingFromMicrophoneButton || isRecordingFromKeyboardShortcut || isFinalizingTranscript
@@ -263,7 +296,12 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     }
 
     private let transcriptionProvider: any BuddyTranscriptionProvider
-    private let audioEngine = AVAudioEngine()
+    /// Replaced with a fresh instance at every session start (see
+    /// `startRecognitionSession`): AVAudioEngine binds its input to the system
+    /// default device when it starts, and a built engine caches that device's
+    /// format — only a fresh engine reliably picks up the session's capture
+    /// device (which we may have just made the default) and its real format.
+    private var audioEngine = AVAudioEngine()
     private var activeTranscriptionSession: (any BuddyStreamingTranscriptionSession)?
     private var activeStartSource: BuddyDictationStartSource?
     private var draftCallbacks: BuddyDictationDraftCallbacks?
@@ -279,16 +317,270 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     /// Timestamp of the last completed permission request, used to debounce
     /// rapid follow-up requests that arrive before macOS updates its cache.
     private var lastPermissionRequestCompletedAt: Date?
+    /// The system default input device that was active before this session
+    /// switched it to the pinned microphone. Restored (best-effort) when the
+    /// session tears down, so the pin is session-scoped and the rest of the OS
+    /// gets its previous default back. `nil` when no switch happened.
+    private var defaultInputDeviceIDToRestoreAfterSession: AudioDeviceID?
+    /// Loudest audio power seen this session (same 0–1 scale as
+    /// `currentAudioPowerLevel`); used to distinguish "user said nothing that
+    /// transcribed" from "the capture device produced silence".
+    private var currentSessionPeakAudioPowerLevel: CGFloat = 0
+    /// Human-readable description of where this session is capturing from
+    /// ("system default" or the pinned mic's name), for the per-session
+    /// diagnostics line.
+    private var currentSessionCaptureDeviceDescription = "system default"
 
     override init() {
         let transcriptionProvider = BuddyTranscriptionProviderFactory.makeDefaultProvider()
         self.transcriptionProvider = transcriptionProvider
         self.transcriptionProviderDisplayName = transcriptionProvider.displayName
         super.init()
+        restoreDefaultInputDeviceAfterUnexpectedTerminationIfNeeded()
     }
 
     func updateContextualKeyterms(_ contextualKeyterms: [String]) {
         self.contextualKeyterms = contextualKeyterms
+    }
+
+    // MARK: - Microphone Selection
+
+    /// Enumerates the microphones the user can pin for push-to-talk capture.
+    /// Uses the macOS 14 device types (`.microphone` for built-in / USB inputs,
+    /// `.external` for other external audio devices). The returned `id` is the
+    /// device UID, which round-trips through UserDefaults and CoreAudio's
+    /// UID→AudioDeviceID translation when a recording session starts.
+    static func availableCaptureMicrophones() -> [CaptureMicrophone] {
+        let discoverySession = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.microphone, .external],
+            mediaType: .audio,
+            position: .unspecified
+        )
+
+        return discoverySession.devices.map { captureDevice in
+            CaptureMicrophone(
+                id: captureDevice.uniqueID,
+                displayName: captureDevice.localizedName
+            )
+        }
+    }
+
+    /// The microphone UID the user has pinned, or `nil` when they want the
+    /// system default input.
+    func preferredMicrophoneUID() -> String? {
+        UserDefaults.standard.string(forKey: Self.preferredMicrophoneUIDDefaultsKey)
+    }
+
+    /// Pins a specific microphone by UID (or clears the pin with `nil` to fall
+    /// back to the system default input). The change takes effect on the next
+    /// push-to-talk session — no restart needed — because the pin is applied
+    /// (as a session-scoped default-input switch) at every session start.
+    func setPreferredMicrophoneUID(_ preferredMicrophoneUID: String?) {
+        if let preferredMicrophoneUID, !preferredMicrophoneUID.isEmpty {
+            UserDefaults.standard.set(preferredMicrophoneUID, forKey: Self.preferredMicrophoneUIDDefaultsKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.preferredMicrophoneUIDDefaultsKey)
+        }
+    }
+
+    /// Translates a CoreAudio device UID into a live `AudioDeviceID`, or returns
+    /// `nil` when no connected device matches (e.g. the pinned microphone was
+    /// unplugged). Callers treat `nil` as "fall back to the system default".
+    private func audioDeviceID(forUID microphoneUID: String) -> AudioDeviceID? {
+        var translationAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var resolvedDeviceID = AudioDeviceID(kAudioObjectUnknown)
+        var resolvedDeviceIDSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var microphoneUIDString = microphoneUID as CFString
+        let translationStatus = withUnsafeMutablePointer(to: &microphoneUIDString) { microphoneUIDPointer in
+            AudioObjectGetPropertyData(
+                AudioObjectID(kAudioObjectSystemObject),
+                &translationAddress,
+                UInt32(MemoryLayout<CFString>.size),
+                microphoneUIDPointer,
+                &resolvedDeviceIDSize,
+                &resolvedDeviceID
+            )
+        }
+        guard translationStatus == noErr, resolvedDeviceID != kAudioObjectUnknown else { return nil }
+        return resolvedDeviceID
+    }
+
+    /// Reads a device's persistent CoreAudio UID so a default-input restore can
+    /// survive launches, where the numeric `AudioDeviceID` is not stable.
+    private func audioDeviceUID(for inputDeviceID: AudioDeviceID) -> String? {
+        var deviceUIDAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceUID: CFString = "" as CFString
+        var deviceUIDSize = UInt32(MemoryLayout<CFString>.size)
+        let readStatus = AudioObjectGetPropertyData(
+            inputDeviceID,
+            &deviceUIDAddress,
+            0,
+            nil,
+            &deviceUIDSize,
+            &deviceUID
+        )
+        guard readStatus == noErr else { return nil }
+        return deviceUID as String
+    }
+
+    /// Records the original default before changing it so an interrupted
+    /// session can be repaired next launch. An existing value is older and
+    /// therefore belongs to the user's true pre-session default.
+    private func persistDefaultInputDeviceForCrashRecoveryIfNeeded(
+        _ previousDefaultInputDeviceID: AudioDeviceID?
+    ) {
+        guard UserDefaults.standard.string(forKey: Self.defaultInputDeviceUIDToRestoreAfterCrashDefaultsKey) == nil else {
+            return
+        }
+        guard let previousDefaultInputDeviceID else {
+            print("⚠️ BuddyDictationManager: could not persist the previous default input because CoreAudio did not return a device")
+            return
+        }
+        guard let previousDefaultInputDeviceUID = audioDeviceUID(for: previousDefaultInputDeviceID) else {
+            print("⚠️ BuddyDictationManager: could not persist the previous default input because its device UID could not be read")
+            return
+        }
+        UserDefaults.standard.set(
+            previousDefaultInputDeviceUID,
+            forKey: Self.defaultInputDeviceUIDToRestoreAfterCrashDefaultsKey
+        )
+    }
+
+    /// Repairs the system default after a prior session was interrupted before
+    /// its normal teardown could restore it. The saved intent is one-shot so a
+    /// disconnected device cannot cause repeated restoration attempts.
+    private func restoreDefaultInputDeviceAfterUnexpectedTerminationIfNeeded() {
+        guard let defaultInputDeviceUIDToRestore = UserDefaults.standard.string(
+            forKey: Self.defaultInputDeviceUIDToRestoreAfterCrashDefaultsKey
+        ) else {
+            return
+        }
+        defer {
+            UserDefaults.standard.removeObject(
+                forKey: Self.defaultInputDeviceUIDToRestoreAfterCrashDefaultsKey
+            )
+        }
+
+        guard let defaultInputDeviceIDToRestore = audioDeviceID(forUID: defaultInputDeviceUIDToRestore) else {
+            print("⚠️ BuddyDictationManager: failed to restore the previous default input because device UID \(defaultInputDeviceUIDToRestore) is unavailable")
+            return
+        }
+        if !setSystemDefaultInputDevice(defaultInputDeviceIDToRestore) {
+            print("⚠️ BuddyDictationManager: failed to restore the previous default input after an interrupted dictation session")
+        }
+    }
+
+    /// Reads the system's current default input device from CoreAudio, or `nil`
+    /// on failure.
+    private func systemDefaultInputDeviceID() -> AudioDeviceID? {
+        var defaultInputAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var defaultInputDeviceID = AudioDeviceID(kAudioObjectUnknown)
+        var defaultInputDeviceIDSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let readStatus = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &defaultInputAddress,
+            0,
+            nil,
+            &defaultInputDeviceIDSize,
+            &defaultInputDeviceID
+        )
+        guard readStatus == noErr, defaultInputDeviceID != kAudioObjectUnknown else { return nil }
+        return defaultInputDeviceID
+    }
+
+    /// Makes a device the system default input. Returns whether the property
+    /// write succeeded.
+    private func setSystemDefaultInputDevice(_ inputDeviceID: AudioDeviceID) -> Bool {
+        var defaultInputAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var mutableInputDeviceID = inputDeviceID
+        let setStatus = AudioObjectSetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &defaultInputAddress,
+            0,
+            nil,
+            UInt32(MemoryLayout<AudioDeviceID>.size),
+            &mutableInputDeviceID
+        )
+        return setStatus == noErr
+    }
+
+    /// Session-scoped microphone pin: if the user pinned a mic and it resolves,
+    /// make it the SYSTEM DEFAULT input for the duration of the session
+    /// (remembering the previous default for restore at teardown).
+    ///
+    /// Why switch the system default instead of setting
+    /// kAudioOutputUnitProperty_CurrentDevice on the input node's AUHAL: field
+    /// diagnostics (Bose + DJI silence bug, round 2) showed that modern macOS
+    /// AVAudioEngine re-binds its input to the system default device at start
+    /// and discards the per-AU device override — the AUHAL pin was cosmetic.
+    /// Capture only ever came from the default input, and with Bluetooth
+    /// headphones connected the default flips to their HFP mic, which often
+    /// fails to engage while A2DP is playing → captured silence, no error.
+    /// Switching the default is the only binding macOS reliably honors.
+    ///
+    /// An unresolvable pin (unplugged mic) logs a warning and proceeds on the
+    /// current default; no preference means no switch at all.
+    private func switchSystemDefaultInputToPinnedMicrophoneIfNeeded() {
+        currentSessionCaptureDeviceDescription = "system default"
+
+        guard let preferredMicrophoneUID = preferredMicrophoneUID(), !preferredMicrophoneUID.isEmpty else {
+            return
+        }
+
+        guard let preferredDeviceID = audioDeviceID(forUID: preferredMicrophoneUID) else {
+            print("⚠️ BuddyDictationManager: preferred microphone \(preferredMicrophoneUID) is unavailable; using system default input")
+            return
+        }
+
+        let pinnedMicrophoneDisplayName = Self.availableCaptureMicrophones()
+            .first { $0.id == preferredMicrophoneUID }?
+            .displayName ?? preferredMicrophoneUID
+
+        let previousDefaultInputDeviceID = systemDefaultInputDeviceID()
+        if previousDefaultInputDeviceID == preferredDeviceID {
+            // Already the default — nothing to switch or restore.
+            currentSessionCaptureDeviceDescription = "\(pinnedMicrophoneDisplayName) (already system default)"
+            return
+        }
+
+        if setSystemDefaultInputDevice(preferredDeviceID) {
+            defaultInputDeviceIDToRestoreAfterSession = previousDefaultInputDeviceID
+            persistDefaultInputDeviceForCrashRecoveryIfNeeded(previousDefaultInputDeviceID)
+            currentSessionCaptureDeviceDescription = "\(pinnedMicrophoneDisplayName) (pinned via default-input switch)"
+        } else {
+            print("⚠️ BuddyDictationManager: failed to make \(pinnedMicrophoneDisplayName) the default input; using system default input")
+        }
+    }
+
+    /// Puts the pre-session default input back (best-effort) if this session
+    /// switched it. Called from the common session-teardown path so every
+    /// stop/cancel/error/finish flow restores the user's previous default.
+    private func restorePreviousDefaultInputIfNeeded() {
+        guard let previousDefaultInputDeviceID = defaultInputDeviceIDToRestoreAfterSession else { return }
+        defaultInputDeviceIDToRestoreAfterSession = nil
+
+        if !setSystemDefaultInputDevice(previousDefaultInputDeviceID) {
+            print("⚠️ BuddyDictationManager: failed to restore the previous default input (device \(previousDefaultInputDeviceID))")
+        }
+        UserDefaults.standard.removeObject(
+            forKey: Self.defaultInputDeviceUIDToRestoreAfterCrashDefaultsKey
+        )
     }
 
     func startPersistentDictationFromMicrophoneButton(
@@ -440,6 +732,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         )
         microphoneButtonRecordingStartedAt = nil
         lastRecordedAudioPowerSampleDate = .distantPast
+        currentSessionPeakAudioPowerLevel = 0
 
         guard !Task.isCancelled else {
             print("🎙️ BuddyDictationManager: start cancelled (shortcut released before recording began)")
@@ -470,6 +763,11 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             )
             print("❌ BuddyDictationManager: failed to start recognition session (\(transcriptionProvider.displayName)): \(error)")
             resetSessionState()
+            // Nothing observes lastErrorMessage today, so a failed engine or
+            // provider start would otherwise be a silent no-op from the user's
+            // point of view — speak up through the same channel as a silent
+            // capture so the failure is never swallowed.
+            onDictationProducedNoAudibleSpeech?()
         }
     }
 
@@ -546,10 +844,29 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         self.activeTranscriptionSession = activeTranscriptionSession
         print("🎙️ BuddyDictationManager: provider ready, starting audio engine")
 
+        // Apply the microphone pin BEFORE creating the fresh engine: the pin is
+        // a session-scoped system-default-input switch (see the method's comment
+        // for why the per-AU AUHAL override does not work), and the engine binds
+        // to whatever the default input is when it is built and started.
+        switchSystemDefaultInputToPinnedMicrophoneIfNeeded()
+
+        // Rebuild the engine from scratch for every dictation session. An
+        // already-built engine stays bound to the device (and cached format) it
+        // was constructed around; only a fresh engine reliably binds to the
+        // current system default input — which we may have just switched to the
+        // pinned mic — and reports that device's real format for the tap.
+        // Push-to-talk cadence is human-scale; engine construction is cheap.
+        audioEngine.stop()
+        audioEngine.inputNode.removeTap(onBus: 0)
+        audioEngine = AVAudioEngine()
+
         let inputNode = audioEngine.inputNode
         let inputFormat = inputNode.outputFormat(forBus: 0)
 
-        inputNode.removeTap(onBus: 0)
+        // One-line capture-path diagnostic so field debugging never has to guess
+        // which device and format a session actually recorded from.
+        print("🎙️ BuddyDictationManager: capturing from \(currentSessionCaptureDeviceDescription) at \(Int(inputFormat.sampleRate))Hz/\(inputFormat.channelCount)ch")
+
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
             self?.activeTranscriptionSession?.appendAudioBuffer(buffer)
             self?.updateAudioPowerLevel(from: buffer)
@@ -588,6 +905,8 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         let finalDraftText = composeDraftText(withTranscribedText: latestRecognizedText)
         let finalTranscriptText = latestRecognizedText.trimmingCharacters(in: .whitespacesAndNewlines)
         let currentDraftCallbacks = draftCallbacks
+        // Snapshot the peak before resetSessionState() clears it.
+        let sessionPeakAudioPowerLevel = currentSessionPeakAudioPowerLevel
 
         if !shouldSubmitFinalDraft && !finalDraftText.isEmpty {
             currentDraftCallbacks?.updateDraftText(finalDraftText)
@@ -598,6 +917,15 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         activeTranscriptionSession?.cancel()
 
         resetSessionState()
+
+        // An empty transcript with a near-zero peak means the capture device
+        // produced silence (not just unintelligible speech) — tell the user
+        // instead of silently doing nothing.
+        if finalTranscriptText.isEmpty
+            && sessionPeakAudioPowerLevel < Self.noAudibleSpeechPeakAudioPowerThreshold {
+            print("⚠️ BuddyDictationManager: session ended with no transcript and peak power \(sessionPeakAudioPowerLevel) — capture was effectively silent")
+            onDictationProducedNoAudibleSpeech?()
+        }
 
         guard shouldSubmitFinalDraft else { return }
         guard !finalTranscriptText.isEmpty else { return }
@@ -647,6 +975,12 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         )
         microphoneButtonRecordingStartedAt = nil
         lastRecordedAudioPowerSampleDate = .distantPast
+        currentSessionPeakAudioPowerLevel = 0
+        currentSessionCaptureDeviceDescription = "system default"
+        // Every stop/cancel/error/finish flow converges here, so this is the one
+        // place that reliably gives the user their previous default input back
+        // after a session-scoped microphone switch.
+        restorePreviousDefaultInputIfNeeded()
     }
 
     private func buildTranscriptionKeyterms() -> [String] {
@@ -661,7 +995,14 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             "Xcode",
             "Vercel",
             "Next.js",
-            "localhost"
+            "localhost",
+            "JavaScript",
+            "TypeScript",
+            "CSS",
+            "flexbox",
+            "teach me",
+            "lesson",
+            "Clicky"
         ]
 
         let combinedKeyterms = baseKeyterms + contextualKeyterms
@@ -708,6 +1049,10 @@ final class BuddyDictationManager: NSObject, ObservableObject {
                 self.currentAudioPowerLevel * 0.72
             )
             self.currentAudioPowerLevel = smoothedAudioPowerLevel
+            self.currentSessionPeakAudioPowerLevel = max(
+                self.currentSessionPeakAudioPowerLevel,
+                CGFloat(boostedLevel)
+            )
 
             let now = Date()
             if now.timeIntervalSince(self.lastRecordedAudioPowerSampleDate)
