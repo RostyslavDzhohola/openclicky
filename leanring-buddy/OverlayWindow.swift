@@ -93,7 +93,7 @@ struct ResponseBubbleSizePreferenceKey: PreferenceKey {
 
 /// The buddy's behavioral mode. Controls whether it follows the cursor,
 /// is flying toward a detected UI element, or is pointing at an element.
-enum BuddyNavigationMode {
+nonisolated enum BuddyNavigationMode: Equatable, Sendable {
     /// Default — buddy follows the mouse cursor with spring animation
     case followingCursor
     /// Buddy is animating toward a detected UI element location
@@ -464,20 +464,23 @@ struct BlueCursorView: View {
 
         var typedCharacterCount = 0
         responseTypingTimer = Timer.scheduledTimer(withTimeInterval: 0.045, repeats: true) { typingTimer in
-            guard self.responseBubbleGenerationID == spokenBubble.id else {
-                typingTimer.invalidate()
-                return
+            // Timer callback types cannot encode main-actor isolation, so hop asynchronously instead of forcing a synchronous bridge.
+            Task { @MainActor in
+                guard self.responseBubbleGenerationID == spokenBubble.id else {
+                    typingTimer.invalidate()
+                    return
+                }
+                guard typedCharacterCount < spokenBubble.text.count else {
+                    typingTimer.invalidate()
+                    return
+                }
+                let nextCharacterIndex = spokenBubble.text.index(
+                    spokenBubble.text.startIndex,
+                    offsetBy: typedCharacterCount
+                )
+                self.responseBubbleTypedText.append(spokenBubble.text[nextCharacterIndex])
+                typedCharacterCount += 1
             }
-            guard typedCharacterCount < spokenBubble.text.count else {
-                typingTimer.invalidate()
-                return
-            }
-            let nextCharacterIndex = spokenBubble.text.index(
-                spokenBubble.text.startIndex,
-                offsetBy: typedCharacterCount
-            )
-            self.responseBubbleTypedText.append(spokenBubble.text[nextCharacterIndex])
-            typedCharacterCount += 1
         }
     }
 
@@ -485,35 +488,37 @@ struct BlueCursorView: View {
 
     private func startTrackingCursor() {
         timer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { _ in
-            let mouseLocation = NSEvent.mouseLocation
-            self.isCursorOnThisScreen = self.screenFrame.contains(mouseLocation)
+            Task { @MainActor in
+                let mouseLocation = NSEvent.mouseLocation
+                self.isCursorOnThisScreen = self.screenFrame.contains(mouseLocation)
 
-            // During forward flight or pointing, the buddy is NOT interrupted by
-            // mouse movement — it completes its full animation and return flight.
-            // Only during the RETURN flight do we allow cursor movement to cancel
-            // (so the buddy snaps to following if the user moves while it's flying back).
-            if self.buddyNavigationMode == .navigatingToTarget && self.isReturningToCursor {
-                let currentMouseInSwiftUI = self.convertScreenPointToSwiftUICoordinates(mouseLocation)
-                let distanceFromNavigationStart = hypot(
-                    currentMouseInSwiftUI.x - self.cursorPositionWhenNavigationStarted.x,
-                    currentMouseInSwiftUI.y - self.cursorPositionWhenNavigationStarted.y
-                )
-                if distanceFromNavigationStart > 100 {
-                    cancelNavigationAndResumeFollowing()
+                // During forward flight or pointing, the buddy is NOT interrupted by
+                // mouse movement — it completes its full animation and return flight.
+                // Only during the RETURN flight do we allow cursor movement to cancel
+                // (so the buddy snaps to following if the user moves while it's flying back).
+                if self.buddyNavigationMode == .navigatingToTarget && self.isReturningToCursor {
+                    let currentMouseInSwiftUI = self.convertScreenPointToSwiftUICoordinates(mouseLocation)
+                    let distanceFromNavigationStart = hypot(
+                        currentMouseInSwiftUI.x - self.cursorPositionWhenNavigationStarted.x,
+                        currentMouseInSwiftUI.y - self.cursorPositionWhenNavigationStarted.y
+                    )
+                    if distanceFromNavigationStart > 100 {
+                        cancelNavigationAndResumeFollowing()
+                    }
+                    return
                 }
-                return
-            }
 
-            // During forward navigation or pointing, just skip cursor tracking
-            if self.buddyNavigationMode != .followingCursor {
-                return
-            }
+                // During forward navigation or pointing, just skip cursor tracking
+                if self.buddyNavigationMode != .followingCursor {
+                    return
+                }
 
-            // Normal cursor following
-            let swiftUIPosition = self.convertScreenPointToSwiftUICoordinates(mouseLocation)
-            let buddyX = swiftUIPosition.x + 35
-            let buddyY = swiftUIPosition.y + 25
-            self.cursorPosition = CGPoint(x: buddyX, y: buddyY)
+                // Normal cursor following
+                let swiftUIPosition = self.convertScreenPointToSwiftUICoordinates(mouseLocation)
+                let buddyX = swiftUIPosition.x + 35
+                let buddyY = swiftUIPosition.y + 25
+                self.cursorPosition = CGPoint(x: buddyX, y: buddyY)
+            }
         }
     }
 
@@ -569,7 +574,7 @@ struct BlueCursorView: View {
     /// for a "swooping" feel, and the glow intensifies during flight.
     private func animateBezierFlightArc(
         to destination: CGPoint,
-        onComplete: @escaping () -> Void
+        onComplete: @MainActor @escaping () -> Void
     ) {
         navigationAnimationTimer?.invalidate()
 
@@ -597,48 +602,50 @@ struct BlueCursorView: View {
         let controlPoint = CGPoint(x: midPoint.x, y: midPoint.y - arcHeight)
 
         navigationAnimationTimer = Timer.scheduledTimer(withTimeInterval: frameInterval, repeats: true) { _ in
-            currentFrame += 1
+            Task { @MainActor in
+                currentFrame += 1
 
-            if currentFrame > totalFrames {
-                self.navigationAnimationTimer?.invalidate()
-                self.navigationAnimationTimer = nil
-                self.cursorPosition = endPosition
-                self.buddyFlightScale = 1.0
-                onComplete()
-                return
+                if currentFrame > totalFrames {
+                    self.navigationAnimationTimer?.invalidate()
+                    self.navigationAnimationTimer = nil
+                    self.cursorPosition = endPosition
+                    self.buddyFlightScale = 1.0
+                    onComplete()
+                    return
+                }
+
+                // Linear progress 0→1 over the flight duration
+                let linearProgress = Double(currentFrame) / Double(totalFrames)
+
+                // Smoothstep easeInOut: 3t² - 2t³ (Hermite interpolation)
+                let t = linearProgress * linearProgress * (3.0 - 2.0 * linearProgress)
+
+                // Quadratic bezier: B(t) = (1-t)²·P0 + 2(1-t)t·P1 + t²·P2
+                let oneMinusT = 1.0 - t
+                let bezierX = oneMinusT * oneMinusT * startPosition.x
+                            + 2.0 * oneMinusT * t * controlPoint.x
+                            + t * t * endPosition.x
+                let bezierY = oneMinusT * oneMinusT * startPosition.y
+                            + 2.0 * oneMinusT * t * controlPoint.y
+                            + t * t * endPosition.y
+
+                self.cursorPosition = CGPoint(x: bezierX, y: bezierY)
+
+                // Rotation: face the direction of travel by computing the tangent
+                // to the bezier curve. B'(t) = 2(1-t)(P1-P0) + 2t(P2-P1)
+                let tangentX = 2.0 * oneMinusT * (controlPoint.x - startPosition.x)
+                             + 2.0 * t * (endPosition.x - controlPoint.x)
+                let tangentY = 2.0 * oneMinusT * (controlPoint.y - startPosition.y)
+                             + 2.0 * t * (endPosition.y - controlPoint.y)
+                // +90° offset because the triangle's "tip" points up at 0° rotation,
+                // and atan2 returns 0° for rightward movement
+                self.triangleRotationDegrees = atan2(tangentY, tangentX) * (180.0 / .pi) + 90.0
+
+                // Scale pulse: sin curve peaks at midpoint of the flight.
+                // Buddy grows to ~1.3x at the apex, then shrinks back to 1.0x on landing.
+                let scalePulse = sin(linearProgress * .pi)
+                self.buddyFlightScale = 1.0 + scalePulse * 0.3
             }
-
-            // Linear progress 0→1 over the flight duration
-            let linearProgress = Double(currentFrame) / Double(totalFrames)
-
-            // Smoothstep easeInOut: 3t² - 2t³ (Hermite interpolation)
-            let t = linearProgress * linearProgress * (3.0 - 2.0 * linearProgress)
-
-            // Quadratic bezier: B(t) = (1-t)²·P0 + 2(1-t)t·P1 + t²·P2
-            let oneMinusT = 1.0 - t
-            let bezierX = oneMinusT * oneMinusT * startPosition.x
-                        + 2.0 * oneMinusT * t * controlPoint.x
-                        + t * t * endPosition.x
-            let bezierY = oneMinusT * oneMinusT * startPosition.y
-                        + 2.0 * oneMinusT * t * controlPoint.y
-                        + t * t * endPosition.y
-
-            self.cursorPosition = CGPoint(x: bezierX, y: bezierY)
-
-            // Rotation: face the direction of travel by computing the tangent
-            // to the bezier curve. B'(t) = 2(1-t)(P1-P0) + 2t(P2-P1)
-            let tangentX = 2.0 * oneMinusT * (controlPoint.x - startPosition.x)
-                         + 2.0 * t * (endPosition.x - controlPoint.x)
-            let tangentY = 2.0 * oneMinusT * (controlPoint.y - startPosition.y)
-                         + 2.0 * t * (endPosition.y - controlPoint.y)
-            // +90° offset because the triangle's "tip" points up at 0° rotation,
-            // and atan2 returns 0° for rightward movement
-            self.triangleRotationDegrees = atan2(tangentY, tangentX) * (180.0 / .pi) + 90.0
-
-            // Scale pulse: sin curve peaks at midpoint of the flight.
-            // Buddy grows to ~1.3x at the apex, then shrinks back to 1.0x on landing.
-            let scalePulse = sin(linearProgress * .pi)
-            self.buddyFlightScale = 1.0 + scalePulse * 0.3
         }
     }
 
@@ -756,21 +763,23 @@ struct BlueCursorView: View {
 
         var currentIndex = 0
         Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { timer in
-            guard currentIndex < self.fullWelcomeMessage.count else {
-                timer.invalidate()
-                // Hold the text for 2 seconds, then fade it out
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                    self.bubbleOpacity = 0.0
+            Task { @MainActor in
+                guard currentIndex < self.fullWelcomeMessage.count else {
+                    timer.invalidate()
+                    // Hold the text for 2 seconds, then fade it out
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                        self.bubbleOpacity = 0.0
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                        self.showWelcome = false
+                    }
+                    return
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-                    self.showWelcome = false
-                }
-                return
-            }
 
-            let index = self.fullWelcomeMessage.index(self.fullWelcomeMessage.startIndex, offsetBy: currentIndex)
-            self.welcomeText.append(self.fullWelcomeMessage[index])
-            currentIndex += 1
+                let index = self.fullWelcomeMessage.index(self.fullWelcomeMessage.startIndex, offsetBy: currentIndex)
+                self.welcomeText.append(self.fullWelcomeMessage[index])
+                currentIndex += 1
+            }
         }
     }
 }

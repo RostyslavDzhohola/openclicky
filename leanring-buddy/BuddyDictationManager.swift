@@ -227,7 +227,7 @@ private struct BuddyDictationDraftCallbacks {
 /// Allows the provider-creation task to cross its async boundary without
 /// claiming that every transcription-session implementation is independently
 /// thread-safe. The session is consumed on the main actor and then owned by
-/// EarlyAudioBufferRelay, which serializes all audio access with its lock.
+/// EarlyAudioBufferRelay, which serializes all provider delivery on its queue.
 private final class StreamingTranscriptionSessionTaskResult: @unchecked Sendable {
     let transcriptionSession: any BuddyStreamingTranscriptionSession
 
@@ -237,10 +237,8 @@ private final class StreamingTranscriptionSessionTaskResult: @unchecked Sendable
 }
 
 /// Bridges the audio-engine tap to a transcription session that may still be
-/// starting. The tap and provider setup run on different executors, so every
-/// transition is serialized by the lock: attach flushes the queued buffers
-/// while holding that lock, which prevents a newly arriving live buffer from
-/// overtaking the startup audio.
+/// starting. The tap and provider setup run on different executors, so a serial
+/// delivery queue orders attachment, startup-buffer flushing, and live audio.
 private final class EarlyAudioBufferRelay: @unchecked Sendable {
     private struct QueuedAudioBuffer {
         let audioBuffer: AVAudioPCMBuffer
@@ -250,6 +248,10 @@ private final class EarlyAudioBufferRelay: @unchecked Sendable {
     private static let maximumQueuedAudioDurationSeconds: TimeInterval = 15
 
     private let stateLock = NSLock()
+    private let transcriptionProviderDeliveryQueue = DispatchQueue(
+        label: "com.openclicky.dictation.transcription-provider-audio-delivery",
+        qos: .userInitiated
+    )
     private var queuedAudioBuffers: [QueuedAudioBuffer] = []
     private var queuedAudioDurationSeconds: TimeInterval = 0
     private var attachedTranscriptionSession: (any BuddyStreamingTranscriptionSession)?
@@ -260,39 +262,57 @@ private final class EarlyAudioBufferRelay: @unchecked Sendable {
     func appendOrForward(_ audioBuffer: AVAudioPCMBuffer) {
         guard audioBuffer.frameLength > 0 else { return }
 
-        stateLock.lock()
-        defer { stateLock.unlock() }
-
-        guard !isDiscarded else { return }
-
-        if let attachedTranscriptionSession {
-            attachedTranscriptionSession.appendAudioBuffer(audioBuffer)
+        // AVAudioEngine owns and may reuse the tap's buffer after the callback
+        // returns. Every asynchronously delivered buffer therefore needs an
+        // independent copy rather than retaining mutable HAL-owned memory.
+        let sourceAudioBuffers = UnsafeMutableAudioBufferListPointer(audioBuffer.mutableAudioBufferList)
+        guard !sourceAudioBuffers.isEmpty,
+              sourceAudioBuffers.allSatisfy({ sourceAudioBuffer in
+                  sourceAudioBuffer.mData != nil && sourceAudioBuffer.mDataByteSize > 0
+              }) else {
             return
         }
-
-        // AVAudioEngine owns and may reuse the tap's buffer after the callback
-        // returns. Queue an independent copy so provider startup can safely
-        // outlive that callback without retaining mutable HAL-owned memory.
         guard let copiedAudioBuffer = Self.copyAudioBuffer(audioBuffer) else { return }
 
-        let audioBufferDurationSeconds = TimeInterval(audioBuffer.frameLength) / audioBuffer.format.sampleRate
-        queuedAudioBuffers.append(
-            QueuedAudioBuffer(
-                audioBuffer: copiedAudioBuffer,
-                durationSeconds: audioBufferDurationSeconds
-            )
-        )
-        queuedAudioDurationSeconds += audioBufferDurationSeconds
+        // The realtime render thread must never wait on Speech framework
+        // workers; doing provider delivery here creates a Thread Performance
+        // Checker priority-inversion hang risk.
+        transcriptionProviderDeliveryQueue.async { [self] in
+            stateLock.lock()
 
-        while queuedAudioDurationSeconds > Self.maximumQueuedAudioDurationSeconds,
-              !queuedAudioBuffers.isEmpty {
-            let discardedOldestAudioBuffer = queuedAudioBuffers.removeFirst()
-            queuedAudioDurationSeconds -= discardedOldestAudioBuffer.durationSeconds
-
-            if !hasPrintedQueueCapacityWarning {
-                hasPrintedQueueCapacityWarning = true
-                print("⚠️ BuddyDictationManager: transcription provider startup exceeded the 15-second early-audio buffer; dropping oldest audio")
+            guard !isDiscarded else {
+                stateLock.unlock()
+                return
             }
+
+            if let attachedTranscriptionSession {
+                stateLock.unlock()
+                attachedTranscriptionSession.appendAudioBuffer(copiedAudioBuffer)
+                return
+            }
+
+            let audioBufferDurationSeconds = TimeInterval(copiedAudioBuffer.frameLength)
+                / copiedAudioBuffer.format.sampleRate
+            queuedAudioBuffers.append(
+                QueuedAudioBuffer(
+                    audioBuffer: copiedAudioBuffer,
+                    durationSeconds: audioBufferDurationSeconds
+                )
+            )
+            queuedAudioDurationSeconds += audioBufferDurationSeconds
+
+            while queuedAudioDurationSeconds > Self.maximumQueuedAudioDurationSeconds,
+                  !queuedAudioBuffers.isEmpty {
+                let discardedOldestAudioBuffer = queuedAudioBuffers.removeFirst()
+                queuedAudioDurationSeconds -= discardedOldestAudioBuffer.durationSeconds
+
+                if !hasPrintedQueueCapacityWarning {
+                    hasPrintedQueueCapacityWarning = true
+                    print("⚠️ BuddyDictationManager: transcription provider startup exceeded the 15-second early-audio buffer; dropping oldest audio")
+                }
+            }
+
+            stateLock.unlock()
         }
     }
 
@@ -306,21 +326,40 @@ private final class EarlyAudioBufferRelay: @unchecked Sendable {
     }
 
     func attach(_ transcriptionSession: any BuddyStreamingTranscriptionSession) {
-        stateLock.lock()
-        defer { stateLock.unlock() }
+        transcriptionProviderDeliveryQueue.async { [self] in
+            stateLock.lock()
 
-        guard !isDiscarded else { return }
+            guard !isDiscarded else {
+                stateLock.unlock()
+                return
+            }
 
-        attachedTranscriptionSession = transcriptionSession
+            attachedTranscriptionSession = transcriptionSession
+            let startupAudioBuffers = queuedAudioBuffers
+            queuedAudioBuffers.removeAll(keepingCapacity: false)
+            queuedAudioDurationSeconds = 0
+            stateLock.unlock()
 
-        // Flush under the same lock used by appendOrForward so live tap audio
-        // cannot reach the provider before the queued startup audio.
-        for queuedAudioBuffer in queuedAudioBuffers {
-            transcriptionSession.appendAudioBuffer(queuedAudioBuffer.audioBuffer)
+            // This flush shares the live-audio delivery queue, preserving tap
+            // order without holding the state lock across provider calls.
+            for startupAudioBuffer in startupAudioBuffers {
+                transcriptionSession.appendAudioBuffer(startupAudioBuffer.audioBuffer)
+            }
         }
+    }
 
-        queuedAudioBuffers.removeAll(keepingCapacity: false)
-        queuedAudioDurationSeconds = 0
+    func requestFinalTranscriptAfterDeliveringPendingAudio() {
+        transcriptionProviderDeliveryQueue.async { [self] in
+            stateLock.lock()
+
+            guard !isDiscarded, let attachedTranscriptionSession else {
+                stateLock.unlock()
+                return
+            }
+
+            stateLock.unlock()
+            attachedTranscriptionSession.requestFinalTranscript()
+        }
     }
 
     func discard() {
@@ -453,6 +492,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     /// format — only a fresh engine reliably picks up the session's capture
     /// device (which we may have just made the default) and its real format.
     private var audioEngine = AVAudioEngine()
+    private var isInputTapInstalled = false
     private var activeTranscriptionSession: (any BuddyStreamingTranscriptionSession)?
     private var activeTranscriptionSessionCreationTask: Task<StreamingTranscriptionSessionTaskResult, Error>?
     private var activeEarlyAudioBufferRelay: EarlyAudioBufferRelay?
@@ -662,6 +702,11 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     /// Makes a device the system default input. Returns whether the property
     /// write succeeded.
     private func setSystemDefaultInputDevice(_ inputDeviceID: AudioDeviceID) -> Bool {
+        guard inputDeviceID != kAudioObjectUnknown else {
+            print("⚠️ BuddyDictationManager: cannot set the system default input to unknown CoreAudio device ID 0")
+            return false
+        }
+
         var defaultInputAddress = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDefaultInputDevice,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -955,9 +1000,12 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         let finalTranscriptFallbackDelaySeconds = activeTranscriptionSession?.finalTranscriptFallbackDelaySeconds
             ?? Self.defaultFinalTranscriptFallbackDelaySeconds
 
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
-        activeTranscriptionSession?.requestFinalTranscript()
+        stopAudioEngineAndRemoveInputTapIfInstalled()
+        if let activeEarlyAudioBufferRelay {
+            activeEarlyAudioBufferRelay.requestFinalTranscriptAfterDeliveringPendingAudio()
+        } else {
+            activeTranscriptionSession?.requestFinalTranscript()
+        }
 
         scheduleFinalTranscriptFallback(after: finalTranscriptFallbackDelaySeconds)
     }
@@ -1011,6 +1059,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
 
             self?.updateAudioPowerLevel(from: buffer)
         }
+        isInputTapInstalled = true
 
         audioEngine.prepare()
         try audioEngine.start()
@@ -1086,7 +1135,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         // setup completes. Flush first, then close the provider input so that
         // the buffered utterance is included in its final transcript.
         if isFinalizingTranscript {
-            newlyCreatedTranscriptionSession.requestFinalTranscript()
+            earlyAudioBufferRelay.requestFinalTranscriptAfterDeliveringPendingAudio()
             scheduleFinalTranscriptFallback(
                 after: newlyCreatedTranscriptionSession.finalTranscriptFallbackDelaySeconds
             )
@@ -1235,9 +1284,17 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         currentDraftCallbacks?.submitDraftText(finalDraftText)
     }
 
-    private func tearDownActiveRecognitionResources() {
+    private func stopAudioEngineAndRemoveInputTapIfInstalled() {
+        if isInputTapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            isInputTapInstalled = false
+        }
+
         audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
+    }
+
+    private func tearDownActiveRecognitionResources() {
+        stopAudioEngineAndRemoveInputTapIfInstalled()
         activeTranscriptionSessionCreationTask?.cancel()
         activeTranscriptionSessionCreationTask = nil
         transcriptionProviderStartupBeganAt = nil

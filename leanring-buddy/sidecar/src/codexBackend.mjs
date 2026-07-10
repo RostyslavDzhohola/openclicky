@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { Codex } from "@openai/codex-sdk";
 import { buildCodexChildEnvironment } from "./codexHome.mjs";
 import { emitLog } from "./protocol.mjs";
+import { codexSubagentCapabilityStatus } from "./agentActivity.mjs";
 import {
   readWorkspaceMetadata,
   updateWorkspaceMetadata,
@@ -251,6 +252,8 @@ export async function runCodexChatTurn({
   const effortLevel = resolveCodexEffortLevel(effort);
   let session = obtainSession(workspaceId, resolvedModel, effortLevel);
   const turnText = teachIntent ? `$teach ${text}` : text;
+
+  onStatus?.(codexSubagentCapabilityStatus());
 
   let turnResult;
   try {

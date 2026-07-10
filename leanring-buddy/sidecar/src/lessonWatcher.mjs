@@ -13,6 +13,7 @@ import { recentClaudeBashCommands } from "./claudeBackend.mjs";
 import { recentCodexShellCommands } from "./codexBackend.mjs";
 import { workspacePath } from "./workspaces.mjs";
 import { regenerateLessonsDashboard } from "./lessonsDashboard.mjs";
+import { traceAgentEvent } from "./agentTrace.mjs";
 
 const LESSON_OPEN_GRACE_PERIOD_MS = 2_000;
 const TEACH_TURN_HOLD_SAFETY_TIMEOUT_MS = 15 * 60 * 1_000;
@@ -51,19 +52,28 @@ export function createLessonEventCoordinator({
   regenerateDashboard,
   emitLessonCreatedEvent,
   emitLog,
+  emitTrace = () => {},
   gracePeriodMs = LESSON_OPEN_GRACE_PERIOD_MS,
   holdSafetyTimeoutMs = TEACH_TURN_HOLD_SAFETY_TIMEOUT_MS,
 }) {
   /** workspaceId → active, reference-counted teach turn hold */
   const activeTeachTurnHolds = new Map();
 
-  function emitLessonCreated({ workspaceId, addedFilePath, wasHeld, heldForMs }) {
+  function emitLessonCreated({ workspaceId, addedFilePath, wasHeld, heldForMs, correlation = {} }) {
     const lessonFileName = basename(addedFilePath);
     const shellCommands = getShellCommandsForWorkspace(workspaceId);
     const openedByAgent = didAgentOpenLesson(shellCommands, lessonFileName);
     const truncatedCommands = truncatedCommandsForLog(shellCommands);
 
     regenerateDashboard();
+    emitTrace("lesson.emitted", {
+      ...correlation,
+      workspaceId,
+      path: addedFilePath,
+      openedByAgent,
+      wasHeld,
+      heldForMs: Math.round(heldForMs),
+    });
     emitLog(
       "info",
       `lessonCreated ${lessonFileName} workspace=${workspaceId} openedByAgent=${openedByAgent} held=${wasHeld} heldForMs=${Math.round(heldForMs)} commands=[${truncatedCommands}]`
@@ -73,6 +83,7 @@ export function createLessonEventCoordinator({
       workspaceId,
       path: addedFilePath,
       openedByAgent,
+      ...correlation,
     });
   }
 
@@ -84,6 +95,7 @@ export function createLessonEventCoordinator({
         addedFilePath: queuedLesson.addedFilePath,
         wasHeld: true,
         heldForMs,
+        correlation: activeTeachTurnHold.correlation,
       });
     }
   }
@@ -96,7 +108,7 @@ export function createLessonEventCoordinator({
     return true;
   }
 
-  function beginTeachTurnHold(workspaceId) {
+  function beginTeachTurnHold(workspaceId, correlation = {}) {
     const existingTeachTurnHold = activeTeachTurnHolds.get(workspaceId);
     if (existingTeachTurnHold) {
       existingTeachTurnHold.referenceCount += 1;
@@ -107,12 +119,20 @@ export function createLessonEventCoordinator({
       referenceCount: 1,
       startedAt: Date.now(),
       queuedLessons: [],
+      correlation,
       safetyTimeout: null,
     };
     activeTeachTurnHold.safetyTimeout = setTimeout(() => {
       if (activeTeachTurnHolds.get(workspaceId) !== activeTeachTurnHold) return;
 
       activeTeachTurnHolds.delete(workspaceId);
+      if (activeTeachTurnHold.shouldDiscardQueuedLessons) {
+        emitLog(
+          "info",
+          `dropping ${activeTeachTurnHold.queuedLessons.length} queued lesson(s) for ${workspaceId}`
+        );
+        return;
+      }
       emitLog(
         "warn",
         `teach turn hold for ${workspaceId} exceeded ${holdSafetyTimeoutMs}ms; safety-flushing ${activeTeachTurnHold.queuedLessons.length} queued lesson(s)`
@@ -122,21 +142,43 @@ export function createLessonEventCoordinator({
     // A crashed request must not keep the sidecar alive just for this backstop.
     activeTeachTurnHold.safetyTimeout.unref?.();
     activeTeachTurnHolds.set(workspaceId, activeTeachTurnHold);
+    emitTrace("watcher.hold-started", { ...correlation, workspaceId });
   }
 
-  function endTeachTurnHold(workspaceId) {
+  function endTeachTurnHold(workspaceId, { discardQueuedLessons = false } = {}) {
     const activeTeachTurnHold = activeTeachTurnHolds.get(workspaceId);
     if (!activeTeachTurnHold) return;
 
+    if (discardQueuedLessons) {
+      activeTeachTurnHold.shouldDiscardQueuedLessons = true;
+    }
     activeTeachTurnHold.referenceCount -= 1;
     if (activeTeachTurnHold.referenceCount > 0) return;
 
     activeTeachTurnHolds.delete(workspaceId);
     clearTimeout(activeTeachTurnHold.safetyTimeout);
-    flushHeldLessons(workspaceId, activeTeachTurnHold);
+    emitTrace("watcher.hold-ended", {
+      ...activeTeachTurnHold.correlation,
+      workspaceId,
+      queuedLessonCount: activeTeachTurnHold.queuedLessons.length,
+    });
+    if (activeTeachTurnHold.shouldDiscardQueuedLessons) {
+      emitLog(
+        "info",
+        `dropping ${activeTeachTurnHold.queuedLessons.length} queued lesson(s) for ${workspaceId}`
+      );
+    } else {
+      flushHeldLessons(workspaceId, activeTeachTurnHold);
+    }
   }
 
   function handleStabilizedLessonAdd({ workspaceId, addedFilePath }) {
+    const activeTeachTurnHold = activeTeachTurnHolds.get(workspaceId);
+    emitTrace("lesson.detected", {
+      ...activeTeachTurnHold?.correlation,
+      workspaceId,
+      path: addedFilePath,
+    });
     if (queueHeldLesson(workspaceId, addedFilePath)) return;
 
     // Lessons written outside a tracked teach turn retain the existing grace
@@ -166,14 +208,15 @@ const lessonEventCoordinator = createLessonEventCoordinator({
   regenerateDashboard: regenerateLessonsDashboard,
   emitLessonCreatedEvent: emitEvent,
   emitLog: emitSidecarLog,
+  emitTrace: traceAgentEvent,
 });
 
-export function beginTeachTurnHold(workspaceId) {
-  lessonEventCoordinator.beginTeachTurnHold(workspaceId);
+export function beginTeachTurnHold(workspaceId, correlation) {
+  lessonEventCoordinator.beginTeachTurnHold(workspaceId, correlation);
 }
 
-export function endTeachTurnHold(workspaceId) {
-  lessonEventCoordinator.endTeachTurnHold(workspaceId);
+export function endTeachTurnHold(workspaceId, { discardQueuedLessons = false } = {}) {
+  lessonEventCoordinator.endTeachTurnHold(workspaceId, { discardQueuedLessons });
 }
 
 export function watchWorkspaceLessons(workspaceId, backend) {

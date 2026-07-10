@@ -29,6 +29,9 @@ test("begin creates an interview and replaces any previous interview", () => {
     model: "sonnet",
     topicText: "First Topic",
     lessonCountAtInterviewStart: 3,
+    interviewId: "interview-1",
+    parentTurnId: "turn-1",
+    traceId: "trace-1",
   });
   const replacementInterview = interviewTracker.begin({
     workspaceId: "replacement-topic",
@@ -43,6 +46,9 @@ test("begin creates an interview and replaces any previous interview", () => {
     model: "sonnet",
     topicText: "First Topic",
     lessonCountAtInterviewStart: 3,
+    interviewId: "interview-1",
+    parentTurnId: "turn-1",
+    traceId: "trace-1",
     turnCount: 0,
   });
   assert.deepEqual(replacementInterview, {
@@ -51,6 +57,9 @@ test("begin creates an interview and replaces any previous interview", () => {
     model: "gpt-5",
     topicText: "Replacement Topic",
     lessonCountAtInterviewStart: 0,
+    interviewId: undefined,
+    parentTurnId: undefined,
+    traceId: undefined,
     turnCount: 0,
   });
   assert.equal(interviewTracker.activeInterview, replacementInterview);

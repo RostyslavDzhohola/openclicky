@@ -8,7 +8,7 @@
 import Foundation
 
 enum ScreenshotFileStore {
-    static func writeCaptures(_ captures: [(data: Data, label: String)]) throws -> (directoryURL: URL, images: [(path: String, label: String)]) {
+    nonisolated static func writeCaptures(_ captures: [(data: Data, label: String)]) throws -> (directoryURL: URL, images: [(path: String, label: String)]) {
         let directoryURL = try capturesRootDirectoryURL().appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
 
@@ -21,11 +21,11 @@ enum ScreenshotFileStore {
         return (directoryURL: directoryURL, images: images)
     }
 
-    static func cleanUp(directoryURL: URL) {
+    nonisolated static func cleanUp(directoryURL: URL) {
         try? FileManager.default.removeItem(at: directoryURL)
     }
 
-    static func sweepStaleCaptures() {
+    nonisolated static func sweepStaleCaptures() {
         guard let captureDirectoryURLs = try? FileManager.default.contentsOfDirectory(
             at: try capturesRootDirectoryURL(),
             includingPropertiesForKeys: [.contentModificationDateKey],
@@ -43,7 +43,7 @@ enum ScreenshotFileStore {
         }
     }
 
-    private static func capturesRootDirectoryURL() throws -> URL {
+    nonisolated private static func capturesRootDirectoryURL() throws -> URL {
         let applicationSupportURL = try FileManager.default.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,

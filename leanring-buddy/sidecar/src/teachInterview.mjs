@@ -37,13 +37,25 @@ export function createInterviewTracker() {
       return activeInterview;
     },
 
-    begin({ workspaceId, backend, model, topicText, lessonCountAtInterviewStart }) {
+    begin({
+      workspaceId,
+      backend,
+      model,
+      topicText,
+      lessonCountAtInterviewStart,
+      interviewId,
+      parentTurnId,
+      traceId,
+    }) {
       activeInterview = {
         workspaceId,
         backend,
         model,
         topicText,
         lessonCountAtInterviewStart: lessonCountAtInterviewStart ?? 0,
+        interviewId,
+        parentTurnId,
+        traceId,
         turnCount: 0,
       };
       return activeInterview;

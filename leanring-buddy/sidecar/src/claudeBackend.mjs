@@ -15,6 +15,7 @@ import { readFileSync } from "node:fs";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { COMPANION_RULES } from "./companionRules.mjs";
 import { emitLog } from "./protocol.mjs";
+import { describeClaudeSubagentActivity } from "./agentActivity.mjs";
 import {
   readWorkspaceMetadata,
   updateWorkspaceMetadata,
@@ -181,8 +182,13 @@ class ClaudeWorkspaceSession {
         activeTurn?.reject(makeBackendError("auth_required", "claude login expired or missing — run `claude` in terminal and sign in"));
         return;
       }
-      // Ignore subagent traffic; only surface top-level tool activity
-      if (sdkMessage.parent_tool_use_id) return;
+      // Sub-agent prose and reasoning stay private; expose only lifecycle/tool
+      // metadata so a traced Teach turn still shows where work happened.
+      const subagentActivity = describeClaudeSubagentActivity(sdkMessage);
+      if (subagentActivity) {
+        activeTurn?.onStatus?.(subagentActivity);
+        return;
+      }
       const contentBlocks = sdkMessage.message?.content ?? [];
       for (const block of contentBlocks) {
         if (block.type === "tool_use" && activeTurn) {

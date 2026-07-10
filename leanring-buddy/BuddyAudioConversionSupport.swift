@@ -23,6 +23,16 @@ final class BuddyPCM16AudioConverter {
     }
 
     func convertToPCM16Data(from audioBuffer: AVAudioPCMBuffer) -> Data? {
+        guard audioBuffer.frameLength > 0 else { return nil }
+
+        let inputAudioBuffers = UnsafeMutableAudioBufferListPointer(audioBuffer.mutableAudioBufferList)
+        guard !inputAudioBuffers.isEmpty,
+              inputAudioBuffers.allSatisfy({ inputAudioBuffer in
+                  inputAudioBuffer.mData != nil && inputAudioBuffer.mDataByteSize > 0
+              }) else {
+            return nil
+        }
+
         let inputFormatDescription = audioBuffer.format.settings.description
 
         if currentInputFormatDescription != inputFormatDescription {

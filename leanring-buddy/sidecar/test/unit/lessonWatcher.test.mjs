@@ -64,7 +64,11 @@ test("unheld lesson additions use commands available when the grace period ends"
 
 test("held lessons use commands recorded after the add and before the turn flushes", () => {
   const harness = createCoordinatorHarness();
-  harness.coordinator.beginTeachTurnHold("css");
+  harness.coordinator.beginTeachTurnHold("css", {
+    traceId: "trace-1",
+    parentTurnId: "turn-1",
+    dispatchId: "dispatch-1",
+  });
   harness.coordinator.handleStabilizedLessonAdd({
     workspaceId: "css",
     addedFilePath: "/lessons/css/lessons/0001-selectors.html",
@@ -75,6 +79,9 @@ test("held lessons use commands recorded after the add and before the turn flush
 
   assert.equal(harness.emittedLessonEvents.length, 1);
   assert.equal(harness.emittedLessonEvents[0].openedByAgent, true);
+  assert.equal(harness.emittedLessonEvents[0].traceId, "trace-1");
+  assert.equal(harness.emittedLessonEvents[0].parentTurnId, "turn-1");
+  assert.equal(harness.emittedLessonEvents[0].dispatchId, "dispatch-1");
   assert.match(harness.logs[0].message, /held=true/);
 });
 
@@ -149,4 +156,76 @@ test("one hold flushes multiple queued lessons in discovery order", () => {
       "/lessons/css/lessons/0003-animation.html",
     ]
   );
+});
+
+test("discarding a sole hold drops queued lessons without emitting them", () => {
+  const harness = createCoordinatorHarness();
+  harness.coordinator.beginTeachTurnHold("css");
+  harness.coordinator.handleStabilizedLessonAdd({
+    workspaceId: "css",
+    addedFilePath: "/lessons/css/lessons/0001-selectors.html",
+  });
+
+  harness.coordinator.endTeachTurnHold("css", { discardQueuedLessons: true });
+
+  assert.equal(harness.emittedLessonEvents.length, 0);
+  assert.equal(harness.dashboardRegenerationCount, 0);
+  assert.equal(
+    harness.logs.some(
+      (log) => log.level === "info" && /dropping 1 queued lesson/i.test(log.message)
+    ),
+    true
+  );
+});
+
+test("a discard request on one nested hold prevents the final hold from flushing", () => {
+  const harness = createCoordinatorHarness();
+  harness.coordinator.beginTeachTurnHold("css");
+  harness.coordinator.beginTeachTurnHold("css");
+  harness.coordinator.handleStabilizedLessonAdd({
+    workspaceId: "css",
+    addedFilePath: "/lessons/css/lessons/0001-selectors.html",
+  });
+
+  harness.coordinator.endTeachTurnHold("css", { discardQueuedLessons: true });
+  harness.coordinator.endTeachTurnHold("css");
+
+  assert.equal(harness.emittedLessonEvents.length, 0);
+  assert.equal(harness.dashboardRegenerationCount, 0);
+});
+
+test("a marked nested hold discards queued lessons at the safety timeout", async () => {
+  const harness = createCoordinatorHarness({ holdSafetyTimeoutMs: 15 });
+  harness.coordinator.beginTeachTurnHold("css");
+  harness.coordinator.beginTeachTurnHold("css");
+  harness.coordinator.handleStabilizedLessonAdd({
+    workspaceId: "css",
+    addedFilePath: "/lessons/css/lessons/0001-selectors.html",
+  });
+
+  harness.coordinator.endTeachTurnHold("css", { discardQueuedLessons: true });
+  await waitForTimer(30);
+
+  assert.equal(harness.emittedLessonEvents.length, 0);
+  assert.equal(harness.dashboardRegenerationCount, 0);
+  assert.equal(
+    harness.logs.some(
+      (log) => log.level === "info" && /dropping 1 queued lesson/i.test(log.message)
+    ),
+    true
+  );
+});
+
+test("ending a hold without discard keeps the default flush behavior", () => {
+  const harness = createCoordinatorHarness();
+  harness.coordinator.beginTeachTurnHold("css");
+  harness.coordinator.handleStabilizedLessonAdd({
+    workspaceId: "css",
+    addedFilePath: "/lessons/css/lessons/0001-selectors.html",
+  });
+
+  harness.coordinator.endTeachTurnHold("css");
+
+  assert.equal(harness.emittedLessonEvents.length, 1);
+  assert.equal(harness.dashboardRegenerationCount, 1);
 });

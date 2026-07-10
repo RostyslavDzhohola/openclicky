@@ -45,7 +45,9 @@ final class MenuBarPanelManager: NSObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.hidePanel()
+            Task { @MainActor [weak self] in
+                self?.hidePanel()
+            }
         }
     }
 
@@ -215,27 +217,29 @@ final class MenuBarPanelManager: NSObject {
         clickOutsideMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown]
         ) { [weak self] event in
-            guard let self, let panel = self.panel else { return }
+            Task { @MainActor [weak self] in
+                guard let self, let panel = self.panel else { return }
 
-            // Check if the click is inside the status item button — if so, the
-            // statusItemClicked handler will toggle the panel, so don't also hide.
-            let clickLocation = NSEvent.mouseLocation
-            if panel.frame.contains(clickLocation) {
-                return
-            }
-
-            // Delay dismissal slightly to avoid closing the panel when
-            // a system permission dialog appears (e.g. microphone access).
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                guard panel.isVisible else { return }
-
-                // If permissions aren't all granted yet, a system dialog
-                // may have focus — don't dismiss during onboarding.
-                if !self.companionManager.allPermissionsGranted && !NSApp.isActive {
+                // Check if the click is inside the status item button — if so, the
+                // statusItemClicked handler will toggle the panel, so don't also hide.
+                let clickLocation = NSEvent.mouseLocation
+                if panel.frame.contains(clickLocation) {
                     return
                 }
 
-                self.hidePanel()
+                // Delay dismissal slightly to avoid closing the panel when
+                // a system permission dialog appears (e.g. microphone access).
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    guard panel.isVisible else { return }
+
+                    // If permissions aren't all granted yet, a system dialog
+                    // may have focus — don't dismiss during onboarding.
+                    if !self.companionManager.allPermissionsGranted && !NSApp.isActive {
+                        return
+                    }
+
+                    self.hidePanel()
+                }
             }
         }
     }
