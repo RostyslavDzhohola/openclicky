@@ -999,6 +999,24 @@ struct CompanionPanelView: View {
             Text("say \"teach me …\" to start a topic")
                 .font(.system(size: 10))
                 .foregroundColor(DS.Colors.textTertiary)
+
+            ForEach(companionManager.lessonBuildsInProgress.sorted(by: { $0.key < $1.key }), id: \.key) { buildEntry in
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("building your \(buildEntry.value.topicName) lesson…")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(DS.Colors.textPrimary)
+
+                        Text("usually a few minutes — it'll open on its own")
+                            .font(.system(size: 10))
+                            .foregroundColor(DS.Colors.textTertiary)
+                    }
+                }
+                .padding(.top, 2)
+            }
         }
         .padding(.vertical, 4)
     }

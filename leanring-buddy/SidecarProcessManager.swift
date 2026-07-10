@@ -140,7 +140,16 @@ final class SidecarProcessManager: ObservableObject {
 
     /// Fired when a background lesson dispatch fails after the chat turn already
     /// completed — the app speaks this, since no request is pending to throw to.
-    var onTeachError: (((topicName: String, message: String)) -> Void)?
+    var onTeachError: (((workspaceId: String?, topicName: String, message: String)) -> Void)?
+
+    /// Fired when the sidecar wants a line spoken immediately, before the
+    /// request's final result exists (e.g. the course-setup ack that would
+    /// otherwise be silent until the synchronous interview turn finishes).
+    var onSpeakText: ((String) -> Void)?
+
+    /// Fired when a background lesson build begins; paired with lessonCreated /
+    /// teachError so the UI can show a persistent "building" indicator.
+    var onTeachBuildStarted: (((workspaceId: String, topicName: String)) -> Void)?
 
     private let userDefaults = UserDefaults.standard
     private let fileManager = FileManager.default
@@ -702,8 +711,19 @@ final class SidecarProcessManager: ObservableObject {
                 ))
             }
 
+        case "speak":
+            if let text = event.text, !text.isEmpty {
+                onSpeakText?(text)
+            }
+
+        case "teachBuildStarted":
+            if let workspaceId = event.workspaceId {
+                onTeachBuildStarted?((workspaceId: workspaceId, topicName: event.topicName ?? "your topic"))
+            }
+
         case "teachError":
             onTeachError?((
+                workspaceId: event.workspaceId,
                 topicName: event.topicName ?? "your topic",
                 message: event.message ?? "lesson generation failed"
             ))

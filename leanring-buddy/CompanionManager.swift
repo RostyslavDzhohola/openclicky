@@ -43,6 +43,11 @@ struct LessonListing: Identifiable {
     let fileURL: URL
 }
 
+struct LessonBuildInProgress {
+    let topicName: String
+    let startedAt: Date
+}
+
 @MainActor
 final class CompanionManager: ObservableObject {
     @Published private(set) var voiceState: CompanionVoiceState = .idle
@@ -53,6 +58,12 @@ final class CompanionManager: ObservableObject {
     @Published private(set) var hasMicrophonePermission = false
     @Published private(set) var hasScreenContentPermission = false
     @Published private(set) var hasSpeechRecognitionPermission = false
+
+    /// Lesson builds currently running in the sidecar (workspaceId → build info).
+    /// Non-empty makes the panel show a "building your lesson" row; entries clear
+    /// on lessonCreated / teachError, with a 30-minute staleness fallback in case
+    /// the sidecar dies mid-build and neither event ever arrives.
+    @Published private(set) var lessonBuildsInProgress: [String: LessonBuildInProgress] = [:]
 
     /// Screen location (global AppKit coords) of a detected UI element the
     /// buddy should fly to and point at. Parsed from the brain response;
@@ -397,6 +408,7 @@ final class CompanionManager: ObservableObject {
         // editor unless the agent already opened it itself.
         sidecarManager.onLessonCreated = { [weak self] lesson in
             guard let self else { return }
+            self.lessonBuildsInProgress.removeValue(forKey: lesson.workspaceId)
             if lesson.openedByAgent == false {
                 NSWorkspace.shared.open(URL(fileURLWithPath: lesson.path))
             }
@@ -411,11 +423,51 @@ final class CompanionManager: ObservableObject {
 
         sidecarManager.onTeachError = { [weak self] teachError in
             guard let self else { return }
+            if let workspaceId = teachError.workspaceId {
+                self.lessonBuildsInProgress.removeValue(forKey: workspaceId)
+            } else {
+                // Without a workspace id there is nothing to match — clear everything
+                // rather than leave an indicator that can never complete.
+                self.lessonBuildsInProgress.removeAll()
+            }
             print("⚠️ Companion teach dispatch failed for \(teachError.topicName): \(teachError.message)")
             Task { @MainActor in
                 try? await self.textToSpeechClient.speakText(
                     "hit a snag while building your \(teachError.topicName) lesson — mind trying that again?"
                 )
+            }
+        }
+
+        sidecarManager.onTeachBuildStarted = { [weak self] build in
+            guard let self else { return }
+            let startedAt = Date()
+            self.lessonBuildsInProgress[build.workspaceId] = LessonBuildInProgress(
+                topicName: build.topicName,
+                startedAt: startedAt
+            )
+            // Staleness fallback: if the sidecar dies mid-build, lessonCreated and
+            // teachError both never arrive; drop the entry after 30 minutes. The
+            // startedAt check keeps a stale sweep from clearing a NEWER build that
+            // reused the same workspace.
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 30 * 60 * 1_000_000_000)
+                guard let self else { return }
+                if let entry = self.lessonBuildsInProgress[build.workspaceId], entry.startedAt == startedAt {
+                    self.lessonBuildsInProgress.removeValue(forKey: build.workspaceId)
+                }
+            }
+        }
+
+        sidecarManager.onSpeakText = { [weak self] spokenLine in
+            guard let self else { return }
+            // The sidecar chose to speak early, which means the turn is definitely
+            // long-running — the generic long-turn reassurance would only talk over
+            // this more specific line, so stand it down for the rest of the turn.
+            self.longTurnAcknowledgementTask?.cancel()
+            self.longTurnAcknowledgementTask = nil
+            self.hasScheduledLongTurnAcknowledgementForCurrentTurn = true
+            Task { @MainActor in
+                try? await self.textToSpeechClient.speakText(spokenLine)
             }
         }
 
