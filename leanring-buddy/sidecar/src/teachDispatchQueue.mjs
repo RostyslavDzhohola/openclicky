@@ -121,6 +121,12 @@ export function loadPendingDispatchesForRecovery(maximumAgeMilliseconds) {
     }
   }
 
-  writePendingDispatches(pendingDispatches);
+  // Rewrite only when something was actually dropped. Fresh entries are safe
+  // to dispatch either way: they stay in the file by design, and stale entries
+  // are re-filtered by age on every load, so a failed rewrite can only mean
+  // they get counted (and warned about) again on the next startup — never run.
+  if (droppedStaleCount > 0) {
+    writePendingDispatches(pendingDispatches);
+  }
   return { pendingDispatches, droppedStaleCount };
 }
